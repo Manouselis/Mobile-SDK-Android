@@ -24,7 +24,7 @@ import android.widget.EditText;
 import android.widget.ProgressBar;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
-
+import android.widget.Toast;
 import com.dji.sdk.sample.R;
 import com.dji.sdk.sample.demo.bluetooth.BluetoothView;
 import com.dji.sdk.sample.internal.controller.DJISampleApplication;
@@ -43,6 +43,8 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import dji.common.error.DJIError;
 import dji.common.error.DJISDKError;
+import dji.common.gimbal.Attitude;
+import dji.common.gimbal.GimbalState;
 import dji.common.realname.AppActivationState;
 import dji.common.useraccount.UserAccountState;
 import dji.common.util.CommonCallbacks;
@@ -54,6 +56,7 @@ import dji.log.DJILog;
 import dji.log.GlobalConfig;
 import dji.sdk.base.BaseComponent;
 import dji.sdk.base.BaseProduct;
+import dji.sdk.gimbal.Gimbal;
 import dji.sdk.products.Aircraft;
 import dji.sdk.realname.AppActivationManager;
 import dji.sdk.sdkmanager.BluetoothProductConnector;
@@ -62,6 +65,14 @@ import dji.sdk.sdkmanager.DJISDKManager;
 import dji.sdk.sdkmanager.LDMModule;
 import dji.sdk.sdkmanager.LDMModuleType;
 import dji.sdk.useraccount.UserAccountManager;
+
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Created by dji on 15/12/18.
@@ -74,6 +85,14 @@ public class MainContent extends RelativeLayout {
     private AtomicBoolean isRegistrationInProgress = new AtomicBoolean(false);
     private int lastProcess = -1;
     private Handler mHander = new Handler();
+	private static final String ROS_PC_IP = "10.187.118.204";
+	private static final int GIMBAL_UDP_PORT = 5005;
+
+	private final ExecutorService udpExecutor = Executors.newSingleThreadExecutor();
+	private DatagramSocket gimbalSocket;
+	private InetAddress rosPcAddress;
+	private volatile long lastGimbalSendMs = 0;
+	private boolean gimbalBridgeStarted = false;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -709,4 +728,85 @@ public class MainContent extends RelativeLayout {
         DJISampleApplication.getEventBus().post(new MainActivity.ConnectivityChangeEvent());
     }
     //endregion
+
+private void startGimbalUdpBridge() {
+    if (gimbalBridgeStarted) {
+        return;
+    }
+
+    try {
+        gimbalSocket = new DatagramSocket();
+        rosPcAddress = InetAddress.getByName(ROS_PC_IP);
+    } catch (Exception e) {
+        Toast.makeText(getContext(), "UDP init failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        return;
+    }
+
+    BaseProduct product = DJISDKManager.getInstance().getProduct();
+
+    if (!(product instanceof Aircraft)) {
+        Toast.makeText(getContext(), "No aircraft connected yet", Toast.LENGTH_LONG).show();
+        return;
+    }
+
+    Aircraft aircraft = (Aircraft) product;
+    Gimbal gimbal = aircraft.getGimbal();
+
+    if (gimbal == null) {
+        Toast.makeText(getContext(), "Gimbal is null", Toast.LENGTH_LONG).show();
+        return;
+    }
+
+    gimbalBridgeStarted = true;
+
+    gimbal.setStateCallback(new GimbalState.Callback() {
+        @Override
+        public void onUpdate(GimbalState gimbalState) {
+            long now = System.currentTimeMillis();
+
+            // Send about 10 Hz.
+            if (now - lastGimbalSendMs < 100) {
+                return;
+            }
+            lastGimbalSendMs = now;
+
+            Attitude attitude = gimbalState.getAttitudeInDegrees();
+            if (attitude == null) {
+                return;
+            }
+
+            String json = String.format(
+                    Locale.US,
+                    "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
+                    now,
+                    attitude.getPitch(),
+                    attitude.getRoll(),
+                    attitude.getYaw()
+            );
+
+            udpExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    sendUdp(json);
+                }
+            });
+        }
+    });
+
+    Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
+}
+
+private void sendUdp(String message) {
+    try {
+        byte[] data = message.getBytes(StandardCharsets.UTF_8);
+        DatagramPacket packet = new DatagramPacket(
+                data,
+                data.length,
+                rosPcAddress,
+                GIMBAL_UDP_PORT
+        );
+        gimbalSocket.send(packet);
+    } catch (Exception ignored) {
+    }
+}
 }
