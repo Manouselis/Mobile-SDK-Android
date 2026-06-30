@@ -85,14 +85,15 @@ public class MainContent extends RelativeLayout {
     private AtomicBoolean isRegistrationInProgress = new AtomicBoolean(false);
     private int lastProcess = -1;
     private Handler mHander = new Handler();
-	private static final String ROS_PC_IP = "10.187.118.204";
-	private static final int GIMBAL_UDP_PORT = 5005;
+    private static final String ROS_PC_IP = "10.187.118.204";
+    private static final int GIMBAL_UDP_PORT = 5005;
 
-	private final ExecutorService udpExecutor = Executors.newSingleThreadExecutor();
-	private DatagramSocket gimbalSocket;
-	private InetAddress rosPcAddress;
-	private volatile long lastGimbalSendMs = 0;
-	private boolean gimbalBridgeStarted = false;
+    private final ExecutorService udpExecutor = Executors.newSingleThreadExecutor();
+    private volatile DatagramSocket gimbalSocket;
+    private volatile InetAddress rosPcAddress;
+    private volatile long lastGimbalSendMs = 0;
+    private volatile boolean gimbalBridgeStarted = false;
+    private volatile Gimbal gimbalBridgeGimbal;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -344,6 +345,7 @@ public class MainContent extends RelativeLayout {
         if (!isInEditMode()) {
             removeFirmwareVersionListener();
             removeAppActivationListenerIfNeeded();
+            stopGimbalUdpBridge();
             mHandler.removeCallbacksAndMessages(null);
             mHandlerUI.removeCallbacksAndMessages(null);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
@@ -551,12 +553,19 @@ public class MainContent extends RelativeLayout {
                             @Override
                             public void onProductDisconnect() {
                                 Log.d(TAG, "onProductDisconnect");
+                                stopGimbalUdpBridge();
                                 notifyStatusChange();
                             }
 
                             @Override
                             public void onProductConnect(BaseProduct baseProduct) {
                                 Log.d(TAG, String.format("onProductConnect newProduct:%s", baseProduct));
+                                post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        startGimbalUdpBridge();
+                                    }
+                                });
                                 notifyStatusChange();
                             }
 
@@ -624,12 +633,19 @@ public class MainContent extends RelativeLayout {
                             @Override
                             public void onProductDisconnect() {
                                 Log.d(TAG, "onProductDisconnect");
+                                stopGimbalUdpBridge();
                                 notifyStatusChange();
                             }
 
                             @Override
                             public void onProductConnect(BaseProduct baseProduct) {
                                 Log.d(TAG, String.format("onProductConnect newProduct:%s", baseProduct));
+                                post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        startGimbalUdpBridge();
+                                    }
+                                });
                                 notifyStatusChange();
                             }
 
@@ -729,84 +745,108 @@ public class MainContent extends RelativeLayout {
     }
     //endregion
 
-private void startGimbalUdpBridge() {
-    if (gimbalBridgeStarted) {
-        return;
-    }
-
-    try {
-        gimbalSocket = new DatagramSocket();
-        rosPcAddress = InetAddress.getByName(ROS_PC_IP);
-    } catch (Exception e) {
-        Toast.makeText(getContext(), "UDP init failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        return;
-    }
-
-    BaseProduct product = DJISDKManager.getInstance().getProduct();
-
-    if (!(product instanceof Aircraft)) {
-        Toast.makeText(getContext(), "No aircraft connected yet", Toast.LENGTH_LONG).show();
-        return;
-    }
-
-    Aircraft aircraft = (Aircraft) product;
-    Gimbal gimbal = aircraft.getGimbal();
-
-    if (gimbal == null) {
-        Toast.makeText(getContext(), "Gimbal is null", Toast.LENGTH_LONG).show();
-        return;
-    }
-
-    gimbalBridgeStarted = true;
-
-    gimbal.setStateCallback(new GimbalState.Callback() {
-        @Override
-        public void onUpdate(GimbalState gimbalState) {
-            long now = System.currentTimeMillis();
-
-            // Send about 10 Hz.
-            if (now - lastGimbalSendMs < 100) {
-                return;
-            }
-            lastGimbalSendMs = now;
-
-            Attitude attitude = gimbalState.getAttitudeInDegrees();
-            if (attitude == null) {
-                return;
-            }
-
-            String json = String.format(
-                    Locale.US,
-                    "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
-                    now,
-                    attitude.getPitch(),
-                    attitude.getRoll(),
-                    attitude.getYaw()
-            );
-
-            udpExecutor.execute(new Runnable() {
-                @Override
-                public void run() {
-                    sendUdp(json);
-                }
-            });
+    private synchronized void startGimbalUdpBridge() {
+        if (gimbalBridgeStarted) {
+            return;
         }
-    });
 
-    Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
-}
+        BaseProduct product = DJISDKManager.getInstance().getProduct();
 
-private void sendUdp(String message) {
-    try {
-        byte[] data = message.getBytes(StandardCharsets.UTF_8);
-        DatagramPacket packet = new DatagramPacket(
-                data,
-                data.length,
-                rosPcAddress,
-                GIMBAL_UDP_PORT
-        );
-        gimbalSocket.send(packet);
-    } catch (Exception ignored) {
+        if (!(product instanceof Aircraft)) {
+            Toast.makeText(getContext(), "No aircraft connected yet", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Aircraft aircraft = (Aircraft) product;
+        Gimbal gimbal = aircraft.getGimbal();
+
+        if (gimbal == null) {
+            Toast.makeText(getContext(), "Gimbal is null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        DatagramSocket socket = null;
+        try {
+            socket = new DatagramSocket();
+            rosPcAddress = InetAddress.getByName(ROS_PC_IP);
+            gimbalSocket = socket;
+        } catch (Exception e) {
+            if (socket != null) {
+                socket.close();
+            }
+            Toast.makeText(getContext(), "UDP init failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        gimbalBridgeGimbal = gimbal;
+        gimbalBridgeStarted = true;
+
+        gimbal.setStateCallback(new GimbalState.Callback() {
+            @Override
+            public void onUpdate(GimbalState gimbalState) {
+                long now = System.currentTimeMillis();
+
+                // Send about 10 Hz.
+                if (now - lastGimbalSendMs < 100) {
+                    return;
+                }
+                lastGimbalSendMs = now;
+
+                Attitude attitude = gimbalState.getAttitudeInDegrees();
+                if (attitude == null) {
+                    return;
+                }
+
+                String json = String.format(
+                        Locale.US,
+                        "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
+                        now,
+                        attitude.getPitch(),
+                        attitude.getRoll(),
+                        attitude.getYaw()
+                );
+
+                udpExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        sendUdp(json);
+                    }
+                });
+            }
+        });
+
+        Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
     }
-}
+
+    private synchronized void stopGimbalUdpBridge() {
+        if (gimbalBridgeGimbal != null) {
+            gimbalBridgeGimbal.setStateCallback(null);
+            gimbalBridgeGimbal = null;
+        }
+        if (gimbalSocket != null) {
+            gimbalSocket.close();
+            gimbalSocket = null;
+        }
+        rosPcAddress = null;
+        gimbalBridgeStarted = false;
+    }
+
+    private void sendUdp(String message) {
+        try {
+            DatagramSocket socket = gimbalSocket;
+            InetAddress address = rosPcAddress;
+            if (socket == null || address == null || socket.isClosed()) {
+                return;
+            }
+            byte[] data = message.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket packet = new DatagramPacket(
+                    data,
+                    data.length,
+                    address,
+                    GIMBAL_UDP_PORT
+            );
+            socket.send(packet);
+        } catch (Exception ignored) {
+        }
+    }
 }
