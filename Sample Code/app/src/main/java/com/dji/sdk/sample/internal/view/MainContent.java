@@ -44,11 +44,11 @@ import androidx.core.content.ContextCompat;
 import dji.common.error.DJIError;
 import dji.common.error.DJISDKError;
 import dji.common.gimbal.Attitude;
-import dji.common.gimbal.GimbalState;
 import dji.common.realname.AppActivationState;
 import dji.common.useraccount.UserAccountState;
 import dji.common.util.CommonCallbacks;
 import dji.keysdk.DJIKey;
+import dji.keysdk.GimbalKey;
 import dji.keysdk.KeyManager;
 import dji.keysdk.ProductKey;
 import dji.keysdk.callback.KeyListener;
@@ -56,7 +56,6 @@ import dji.log.DJILog;
 import dji.log.GlobalConfig;
 import dji.sdk.base.BaseComponent;
 import dji.sdk.base.BaseProduct;
-import dji.sdk.gimbal.Gimbal;
 import dji.sdk.products.Aircraft;
 import dji.sdk.realname.AppActivationManager;
 import dji.sdk.sdkmanager.BluetoothProductConnector;
@@ -93,7 +92,8 @@ public class MainContent extends RelativeLayout {
     private volatile InetAddress rosPcAddress;
     private volatile long lastGimbalSendMs = 0;
     private volatile boolean gimbalBridgeStarted = false;
-    private volatile Gimbal gimbalBridgeGimbal;
+    private DJIKey gimbalAttitudeKey;
+    private KeyListener gimbalAttitudeUpdater;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -758,10 +758,14 @@ public class MainContent extends RelativeLayout {
         }
 
         Aircraft aircraft = (Aircraft) product;
-        Gimbal gimbal = aircraft.getGimbal();
 
-        if (gimbal == null) {
+        if (aircraft.getGimbal() == null) {
             Toast.makeText(getContext(), "Gimbal is null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (KeyManager.getInstance() == null) {
+            Toast.makeText(getContext(), "KeyManager is null", Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -778,57 +782,59 @@ public class MainContent extends RelativeLayout {
             return;
         }
 
-        gimbalBridgeGimbal = gimbal;
-        gimbalBridgeStarted = true;
-
-        gimbal.setStateCallback(new GimbalState.Callback() {
+        gimbalAttitudeKey = GimbalKey.create(GimbalKey.ATTITUDE_IN_DEGREES);
+        gimbalAttitudeUpdater = new KeyListener() {
             @Override
-            public void onUpdate(GimbalState gimbalState) {
-                long now = System.currentTimeMillis();
-
-                // Send about 10 Hz.
-                if (now - lastGimbalSendMs < 100) {
-                    return;
+            public void onValueChange(Object oldValue, Object newValue) {
+                if (newValue instanceof Attitude) {
+                    sendGimbalAttitude((Attitude) newValue);
                 }
-                lastGimbalSendMs = now;
-
-                Attitude attitude = gimbalState.getAttitudeInDegrees();
-                if (attitude == null) {
-                    return;
-                }
-
-                String json = String.format(
-                        Locale.US,
-                        "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
-                        now,
-                        attitude.getPitch(),
-                        attitude.getRoll(),
-                        attitude.getYaw()
-                );
-
-                udpExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        sendUdp(json);
-                    }
-                });
             }
-        });
+        };
+        KeyManager.getInstance().addListener(gimbalAttitudeKey, gimbalAttitudeUpdater);
+        gimbalBridgeStarted = true;
 
         Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
     }
 
     private synchronized void stopGimbalUdpBridge() {
-        if (gimbalBridgeGimbal != null) {
-            gimbalBridgeGimbal.setStateCallback(null);
-            gimbalBridgeGimbal = null;
+        if (gimbalAttitudeUpdater != null && KeyManager.getInstance() != null) {
+            KeyManager.getInstance().removeListener(gimbalAttitudeUpdater);
         }
+        gimbalAttitudeUpdater = null;
+        gimbalAttitudeKey = null;
         if (gimbalSocket != null) {
             gimbalSocket.close();
             gimbalSocket = null;
         }
         rosPcAddress = null;
         gimbalBridgeStarted = false;
+    }
+
+    private void sendGimbalAttitude(Attitude attitude) {
+        long now = System.currentTimeMillis();
+
+        // Send about 10 Hz.
+        if (now - lastGimbalSendMs < 100) {
+            return;
+        }
+        lastGimbalSendMs = now;
+
+        String json = String.format(
+                Locale.US,
+                "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
+                now,
+                attitude.getPitch(),
+                attitude.getRoll(),
+                attitude.getYaw()
+        );
+
+        udpExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                sendUdp(json);
+            }
+        });
     }
 
     private void sendUdp(String message) {
