@@ -70,8 +70,10 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Created by dji on 15/12/18.
@@ -87,13 +89,14 @@ public class MainContent extends RelativeLayout {
     private static final String ROS_PC_IP = "10.187.118.204";
     private static final int GIMBAL_UDP_PORT = 5005;
 
-    private final ExecutorService udpExecutor = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService udpExecutor = Executors.newSingleThreadScheduledExecutor();
     private volatile DatagramSocket gimbalSocket;
     private volatile InetAddress rosPcAddress;
-    private volatile long lastGimbalSendMs = 0;
     private volatile boolean gimbalBridgeStarted = false;
     private DJIKey gimbalAttitudeKey;
     private KeyListener gimbalAttitudeUpdater;
+    private ScheduledFuture<?> gimbalSendTask;
+    private volatile Attitude latestGimbalAttitude;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -783,26 +786,41 @@ public class MainContent extends RelativeLayout {
         }
 
         gimbalAttitudeKey = GimbalKey.create(GimbalKey.ATTITUDE_IN_DEGREES);
+        Object initialAttitude = KeyManager.getInstance().getValue(gimbalAttitudeKey);
+        if (initialAttitude instanceof Attitude) {
+            latestGimbalAttitude = (Attitude) initialAttitude;
+        }
         gimbalAttitudeUpdater = new KeyListener() {
             @Override
             public void onValueChange(Object oldValue, Object newValue) {
                 if (newValue instanceof Attitude) {
-                    sendGimbalAttitude((Attitude) newValue);
+                    latestGimbalAttitude = (Attitude) newValue;
                 }
             }
         };
         KeyManager.getInstance().addListener(gimbalAttitudeKey, gimbalAttitudeUpdater);
+        gimbalSendTask = udpExecutor.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                pollAndSendGimbalAttitude();
+            }
+        }, 0, 100, TimeUnit.MILLISECONDS);
         gimbalBridgeStarted = true;
 
         Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
     }
 
     private synchronized void stopGimbalUdpBridge() {
+        if (gimbalSendTask != null) {
+            gimbalSendTask.cancel(true);
+            gimbalSendTask = null;
+        }
         if (gimbalAttitudeUpdater != null && KeyManager.getInstance() != null) {
             KeyManager.getInstance().removeListener(gimbalAttitudeUpdater);
         }
         gimbalAttitudeUpdater = null;
         gimbalAttitudeKey = null;
+        latestGimbalAttitude = null;
         if (gimbalSocket != null) {
             gimbalSocket.close();
             gimbalSocket = null;
@@ -811,15 +829,22 @@ public class MainContent extends RelativeLayout {
         gimbalBridgeStarted = false;
     }
 
-    private void sendGimbalAttitude(Attitude attitude) {
-        long now = System.currentTimeMillis();
+    private void pollAndSendGimbalAttitude() {
+        DJIKey key = gimbalAttitudeKey;
+        KeyManager keyManager = KeyManager.getInstance();
+        if (key != null && keyManager != null) {
+            Object currentAttitude = keyManager.getValue(key);
+            if (currentAttitude instanceof Attitude) {
+                latestGimbalAttitude = (Attitude) currentAttitude;
+            }
+        }
 
-        // Send about 10 Hz.
-        if (now - lastGimbalSendMs < 100) {
+        Attitude attitude = latestGimbalAttitude;
+        if (attitude == null) {
             return;
         }
-        lastGimbalSendMs = now;
 
+        long now = System.currentTimeMillis();
         String json = String.format(
                 Locale.US,
                 "{\"t\":%d,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f}",
@@ -829,12 +854,7 @@ public class MainContent extends RelativeLayout {
                 attitude.getYaw()
         );
 
-        udpExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                sendUdp(json);
-            }
-        });
+        sendUdp(json);
     }
 
     private void sendUdp(String message) {
