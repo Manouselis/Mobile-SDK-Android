@@ -94,6 +94,7 @@ import java.util.concurrent.TimeUnit;
 public class MainContent extends RelativeLayout {
 
     public static final String TAG = MainContent.class.getName();
+    private static volatile MainContent activeVideoBridge;
     private String[] permissionArrays;
     private static final int REQUEST_PERMISSION_CODE = 12345;
     private AtomicBoolean isRegistrationInProgress = new AtomicBoolean(false);
@@ -123,8 +124,16 @@ public class MainContent extends RelativeLayout {
     private KeyListener gimbalAttitudeUpdater;
     private ScheduledFuture<?> gimbalSendTask;
     private volatile Attitude latestGimbalAttitude;
-    private VideoFeeder.VideoFeed videoFeed;
-    private VideoFeeder.VideoDataListener videoDataListener;
+    private VideoFeeder.VideoFeed primaryVideoFeed;
+    private VideoFeeder.VideoFeed secondaryVideoFeed;
+    private VideoFeeder.VideoFeed transcodedVideoFeed;
+    private VideoFeeder.VideoDataListener primaryVideoDataListener;
+    private VideoFeeder.VideoDataListener secondaryVideoDataListener;
+    private VideoFeeder.VideoDataListener transcodedVideoDataListener;
+    private VideoFeeder.VideoActiveStatusListener primaryVideoActiveStatusListener;
+    private VideoFeeder.VideoActiveStatusListener secondaryVideoActiveStatusListener;
+    private VideoFeeder.VideoActiveStatusListener transcodedVideoActiveStatusListener;
+    private volatile String selectedVideoFeedName;
     private volatile Socket videoSocket;
     private volatile boolean videoBridgeStarted = false;
     private volatile boolean videoBridgeRunning = false;
@@ -132,7 +141,7 @@ public class MainContent extends RelativeLayout {
 
         @Override
         public void onConnectivityChange(boolean isConnected) {
-            Log.d(TAG, "onComponentConnectivityChanged: " + isConnected);
+        Log.d(TAG, "onComponentConnectivityChanged: " + isConnected);
             notifyStatusChange();
         }
     };
@@ -1116,32 +1125,54 @@ public class MainContent extends RelativeLayout {
             return;
         }
 
-        if (VideoFeeder.getInstance() == null
-                || VideoFeeder.getInstance().getPrimaryVideoFeed() == null) {
+        VideoFeeder videoFeeder = VideoFeeder.getInstance();
+        if (videoFeeder == null) {
             Toast.makeText(getContext(), "Video feed is null", Toast.LENGTH_LONG).show();
             return;
         }
 
+        primaryVideoFeed = videoFeeder.getPrimaryVideoFeed();
+        secondaryVideoFeed = videoFeeder.getSecondaryVideoFeed();
+        try {
+            transcodedVideoFeed = videoFeeder.provideTranscodedVideoFeed();
+        } catch (Exception e) {
+            Log.w(TAG, "Transcoded video feed is unavailable", e);
+            transcodedVideoFeed = null;
+        }
+
+        if (primaryVideoFeed == null && secondaryVideoFeed == null && transcodedVideoFeed == null) {
+            Toast.makeText(getContext(), "Video feeds are null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
         videoQueue.clear();
+        selectedVideoFeedName = null;
         videoBridgeRunning = true;
         videoBridgeStarted = true;
-        videoFeed = VideoFeeder.getInstance().getPrimaryVideoFeed();
-        videoDataListener = new VideoFeeder.VideoDataListener() {
-            @Override
-            public void onReceive(byte[] videoBuffer, int size) {
-                if (!videoBridgeRunning || videoBuffer == null || size <= 0) {
-                    return;
-                }
 
-                byte[] packet = Arrays.copyOf(videoBuffer, size);
-                if (!videoQueue.offer(packet)) {
-                    videoQueue.poll();
-                    videoQueue.offer(packet);
-                }
-            }
-        };
+        if (primaryVideoFeed != null) {
+            primaryVideoDataListener = createVideoDataListener("primary");
+            primaryVideoActiveStatusListener = createVideoActiveStatusListener("primary");
+            registerVideoFeed("primary", primaryVideoFeed, primaryVideoDataListener, primaryVideoActiveStatusListener);
+        }
 
-        videoFeed.addVideoDataListener(videoDataListener);
+        if (secondaryVideoFeed != null) {
+            secondaryVideoDataListener = createVideoDataListener("secondary");
+            secondaryVideoActiveStatusListener = createVideoActiveStatusListener("secondary");
+            registerVideoFeed("secondary", secondaryVideoFeed, secondaryVideoDataListener, secondaryVideoActiveStatusListener);
+        }
+
+        if (transcodedVideoFeed != null) {
+            transcodedVideoDataListener = createVideoDataListener("transcoded");
+            transcodedVideoActiveStatusListener = createVideoActiveStatusListener("transcoded");
+            registerVideoFeed(
+                    "transcoded",
+                    transcodedVideoFeed,
+                    transcodedVideoDataListener,
+                    transcodedVideoActiveStatusListener
+            );
+        }
+
         videoExecutor.execute(new Runnable() {
             @Override
             public void run() {
@@ -1154,19 +1185,143 @@ public class MainContent extends RelativeLayout {
                 "Video TCP bridge started: " + bridgeAddress.getHostAddress(),
                 Toast.LENGTH_LONG
         ).show();
+        activeVideoBridge = this;
     }
 
     private synchronized void stopVideoTcpBridge() {
         videoBridgeRunning = false;
         videoBridgeStarted = false;
 
-        if (videoFeed != null && videoDataListener != null) {
-            videoFeed.removeVideoDataListener(videoDataListener);
+        if (primaryVideoFeed != null && primaryVideoDataListener != null) {
+            primaryVideoFeed.removeVideoDataListener(primaryVideoDataListener);
         }
-        videoFeed = null;
-        videoDataListener = null;
+        if (secondaryVideoFeed != null && secondaryVideoDataListener != null) {
+            secondaryVideoFeed.removeVideoDataListener(secondaryVideoDataListener);
+        }
+        if (transcodedVideoFeed != null && transcodedVideoDataListener != null) {
+            transcodedVideoFeed.removeVideoDataListener(transcodedVideoDataListener);
+        }
+        if (primaryVideoFeed != null && primaryVideoActiveStatusListener != null) {
+            primaryVideoFeed.removeVideoActiveStatusListener(primaryVideoActiveStatusListener);
+        }
+        if (secondaryVideoFeed != null && secondaryVideoActiveStatusListener != null) {
+            secondaryVideoFeed.removeVideoActiveStatusListener(secondaryVideoActiveStatusListener);
+        }
+        if (transcodedVideoFeed != null && transcodedVideoActiveStatusListener != null) {
+            transcodedVideoFeed.removeVideoActiveStatusListener(transcodedVideoActiveStatusListener);
+        }
+        primaryVideoFeed = null;
+        secondaryVideoFeed = null;
+        transcodedVideoFeed = null;
+        primaryVideoDataListener = null;
+        secondaryVideoDataListener = null;
+        transcodedVideoDataListener = null;
+        primaryVideoActiveStatusListener = null;
+        secondaryVideoActiveStatusListener = null;
+        transcodedVideoActiveStatusListener = null;
+        selectedVideoFeedName = null;
         videoQueue.clear();
         closeVideoSocket();
+        if (activeVideoBridge == this) {
+            activeVideoBridge = null;
+        }
+    }
+
+    public static void forwardPreviewVideoPacket(String feedName, byte[] videoBuffer, int size) {
+        MainContent bridge = activeVideoBridge;
+        if (bridge != null) {
+            bridge.enqueueVideoPacket(feedName, videoBuffer, size);
+        }
+    }
+
+    private VideoFeeder.VideoDataListener createVideoDataListener(final String feedName) {
+        return new VideoFeeder.VideoDataListener() {
+            @Override
+            public void onReceive(byte[] videoBuffer, int size) {
+                enqueueVideoPacket(feedName, videoBuffer, size);
+            }
+        };
+    }
+
+    private VideoFeeder.VideoActiveStatusListener createVideoActiveStatusListener(final String feedName) {
+        return new VideoFeeder.VideoActiveStatusListener() {
+            @Override
+            public void onUpdate(boolean isActive) {
+                Log.i(TAG, "DJI " + feedName + " video feed active=" + isActive);
+            }
+        };
+    }
+
+    private void registerVideoFeed(
+            String feedName,
+            VideoFeeder.VideoFeed feed,
+            VideoFeeder.VideoDataListener dataListener,
+            VideoFeeder.VideoActiveStatusListener activeStatusListener
+    ) {
+        boolean dataListenerAdded = false;
+        try {
+            dataListenerAdded = feed.addVideoDataListener(dataListener, true);
+        } catch (Exception e) {
+            Log.w(TAG, "DJI " + feedName + " video feed raw listener registration failed", e);
+        }
+
+        if (!dataListenerAdded) {
+            try {
+                dataListenerAdded = feed.addVideoDataListener(dataListener);
+            } catch (Exception e) {
+                Log.w(TAG, "DJI " + feedName + " video feed listener registration failed", e);
+            }
+        }
+
+        boolean activeListenerAdded = false;
+        try {
+            activeListenerAdded = feed.addVideoActiveStatusListener(activeStatusListener);
+        } catch (Exception e) {
+            Log.w(TAG, "DJI " + feedName + " video active listener registration failed", e);
+        }
+
+        String sourceName = "unknown";
+        try {
+            sourceName = String.valueOf(feed.getVideoSource());
+        } catch (Exception e) {
+            Log.w(TAG, "DJI " + feedName + " video source read failed", e);
+        }
+
+        Log.i(
+                TAG,
+                "DJI " + feedName + " video feed registered: "
+                        + "dataListener=" + dataListenerAdded
+                        + ", activeListener=" + activeListenerAdded
+                        + ", source=" + sourceName
+        );
+    }
+
+    private void enqueueVideoPacket(String feedName, byte[] videoBuffer, int size) {
+        if (!videoBridgeRunning || videoBuffer == null || size <= 0) {
+            return;
+        }
+
+        String selectedFeed = selectedVideoFeedName;
+        if (selectedFeed == null) {
+            synchronized (this) {
+                if (selectedVideoFeedName == null) {
+                    selectedVideoFeedName = feedName;
+                    Log.i(TAG, "DJI video bridge selected " + feedName + " feed");
+                    showBridgeToast("Video feed selected: " + feedName);
+                }
+                selectedFeed = selectedVideoFeedName;
+            }
+        }
+
+        if (!feedName.equals(selectedFeed)) {
+            return;
+        }
+
+        byte[] packet = Arrays.copyOf(videoBuffer, size);
+        if (!videoQueue.offer(packet)) {
+            videoQueue.poll();
+            videoQueue.offer(packet);
+        }
     }
 
     private void streamVideoTcp() {

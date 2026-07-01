@@ -7,6 +7,8 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 
+import com.dji.sdk.sample.internal.view.MainContent;
+
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -100,6 +102,11 @@ public class VideoFeedView extends SurfaceView {
             public void onReceive(byte[] videoBuffer, int size) {
 
                 lastReceivedFrameTime.set(System.currentTimeMillis());
+                MainContent.forwardPreviewVideoPacket(
+                        isPrimaryVideoFeed ? "preview-primary" : "preview-secondary",
+                        videoBuffer,
+                        size
+                );
 
                 if (codecManager != null) {
                     codecManager.sendDataToDecoder(videoBuffer,
