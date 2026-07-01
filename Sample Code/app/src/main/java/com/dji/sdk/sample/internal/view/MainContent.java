@@ -56,6 +56,7 @@ import dji.log.DJILog;
 import dji.log.GlobalConfig;
 import dji.sdk.base.BaseComponent;
 import dji.sdk.base.BaseProduct;
+import dji.sdk.camera.VideoFeeder;
 import dji.sdk.products.Aircraft;
 import dji.sdk.realname.AppActivationManager;
 import dji.sdk.sdkmanager.BluetoothProductConnector;
@@ -65,11 +66,23 @@ import dji.sdk.sdkmanager.LDMModule;
 import dji.sdk.sdkmanager.LDMModuleType;
 import dji.sdk.useraccount.UserAccountManager;
 
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
+import java.net.InetSocketAddress;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -86,17 +99,35 @@ public class MainContent extends RelativeLayout {
     private AtomicBoolean isRegistrationInProgress = new AtomicBoolean(false);
     private int lastProcess = -1;
     private Handler mHander = new Handler();
-    private static final String ROS_PC_IP = "10.187.118.204";
     private static final int GIMBAL_UDP_PORT = 5005;
+    private static final int VIDEO_TCP_PORT = 5006;
+    private static final int DISCOVERY_UDP_PORT = 5007;
+    private static final int DISCOVERY_TIMEOUT_MS = 1500;
+    private static final int DISCOVERY_ATTEMPTS = 3;
+    private static final int DISCOVERY_RETRY_DELAY_MS = 3000;
+    private static final String DISCOVERY_REQUEST = "DJI_ROS2_BRIDGE_DISCOVER";
+    private static final String DISCOVERY_RESPONSE_PREFIX = "DJI_ROS2_BRIDGE|";
+    private static final int VIDEO_QUEUE_CAPACITY = 120;
+    private static final int VIDEO_CONNECT_TIMEOUT_MS = 3000;
 
     private final ScheduledExecutorService udpExecutor = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService bridgeExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService videoExecutor = Executors.newSingleThreadExecutor();
+    private final BlockingQueue<byte[]> videoQueue = new ArrayBlockingQueue<>(VIDEO_QUEUE_CAPACITY);
     private volatile DatagramSocket gimbalSocket;
     private volatile InetAddress rosPcAddress;
+    private volatile boolean bridgeStartupRunning = false;
+    private int bridgeStartGeneration = 0;
     private volatile boolean gimbalBridgeStarted = false;
     private DJIKey gimbalAttitudeKey;
     private KeyListener gimbalAttitudeUpdater;
     private ScheduledFuture<?> gimbalSendTask;
     private volatile Attitude latestGimbalAttitude;
+    private VideoFeeder.VideoFeed videoFeed;
+    private VideoFeeder.VideoDataListener videoDataListener;
+    private volatile Socket videoSocket;
+    private volatile boolean videoBridgeStarted = false;
+    private volatile boolean videoBridgeRunning = false;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -118,6 +149,7 @@ public class MainContent extends RelativeLayout {
             new ViewWrapper(new DemoListView(getContext()), R.string.activity_component_list);
     private ViewWrapper bluetoothView;
     private EditText mBridgeModeEditText;
+    private EditText mRosBridgeIpEditText;
     private CheckBox mCheckboxFirmware;
     private Handler mHandler;
     private Handler mHandlerUI;
@@ -193,6 +225,7 @@ public class MainContent extends RelativeLayout {
         getmBtnRegisterAppForLDM = (Button) findViewById(R.id.btn_registerAppForLDM);
         mBtnOpen = (Button) findViewById(R.id.btn_open);
         mBridgeModeEditText = (EditText) findViewById(R.id.edittext_bridge_ip);
+        mRosBridgeIpEditText = (EditText) findViewById(R.id.edittext_ros_bridge_ip);
         mBtnBluetooth = (Button) findViewById(R.id.btn_bluetooth);
         mCheckboxFirmware = (CheckBox) findViewById(R.id.checkbox_firmware);
 
@@ -348,7 +381,7 @@ public class MainContent extends RelativeLayout {
         if (!isInEditMode()) {
             removeFirmwareVersionListener();
             removeAppActivationListenerIfNeeded();
-            stopGimbalUdpBridge();
+            stopDjiRosBridge();
             mHandler.removeCallbacksAndMessages(null);
             mHandlerUI.removeCallbacksAndMessages(null);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
@@ -556,7 +589,7 @@ public class MainContent extends RelativeLayout {
                             @Override
                             public void onProductDisconnect() {
                                 Log.d(TAG, "onProductDisconnect");
-                                stopGimbalUdpBridge();
+                                stopDjiRosBridge();
                                 notifyStatusChange();
                             }
 
@@ -566,7 +599,7 @@ public class MainContent extends RelativeLayout {
                                 post(new Runnable() {
                                     @Override
                                     public void run() {
-                                        startGimbalUdpBridge();
+                                        startDjiRosBridge();
                                     }
                                 });
                                 notifyStatusChange();
@@ -636,7 +669,7 @@ public class MainContent extends RelativeLayout {
                             @Override
                             public void onProductDisconnect() {
                                 Log.d(TAG, "onProductDisconnect");
-                                stopGimbalUdpBridge();
+                                stopDjiRosBridge();
                                 notifyStatusChange();
                             }
 
@@ -646,7 +679,7 @@ public class MainContent extends RelativeLayout {
                                 post(new Runnable() {
                                     @Override
                                     public void run() {
-                                        startGimbalUdpBridge();
+                                        startDjiRosBridge();
                                     }
                                 });
                                 notifyStatusChange();
@@ -748,6 +781,194 @@ public class MainContent extends RelativeLayout {
     }
     //endregion
 
+    private synchronized void startDjiRosBridge() {
+        if (bridgeStartupRunning || gimbalBridgeStarted || videoBridgeStarted) {
+            return;
+        }
+
+        bridgeStartupRunning = true;
+        final int startupGeneration = ++bridgeStartGeneration;
+
+        bridgeExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final InetAddress bridgeAddress = discoverRosBridgeAddress();
+                if (bridgeAddress == null) {
+                    synchronized (MainContent.this) {
+                        if (startupGeneration == bridgeStartGeneration) {
+                            bridgeStartupRunning = false;
+                        }
+                    }
+                    showBridgeToast("DJI ROS bridge discovery failed");
+                    retryDjiRosBridgeIfProductConnected();
+                    return;
+                }
+
+                synchronized (MainContent.this) {
+                    if (!bridgeStartupRunning || startupGeneration != bridgeStartGeneration) {
+                        return;
+                    }
+                    rosPcAddress = bridgeAddress;
+                }
+
+                post(new Runnable() {
+                    @Override
+                    public void run() {
+                        synchronized (MainContent.this) {
+                            if (!bridgeStartupRunning || startupGeneration != bridgeStartGeneration) {
+                                return;
+                            }
+                        }
+
+                        startGimbalUdpBridge();
+                        startVideoTcpBridge();
+
+                        synchronized (MainContent.this) {
+                            if (startupGeneration == bridgeStartGeneration) {
+                                bridgeStartupRunning = false;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private synchronized void stopDjiRosBridge() {
+        bridgeStartGeneration++;
+        bridgeStartupRunning = false;
+        stopGimbalUdpBridge();
+        stopVideoTcpBridge();
+        rosPcAddress = null;
+    }
+
+    private InetAddress discoverRosBridgeAddress() {
+        InetAddress manualBridgeAddress = getManualBridgeAddress();
+        if (manualBridgeAddress != null) {
+            return manualBridgeAddress;
+        }
+
+        DatagramSocket socket = null;
+        try {
+            socket = new DatagramSocket();
+            socket.setBroadcast(true);
+            socket.setSoTimeout(DISCOVERY_TIMEOUT_MS);
+
+            byte[] request = DISCOVERY_REQUEST.getBytes(StandardCharsets.UTF_8);
+            byte[] responseBuffer = new byte[512];
+            for (int attempt = 0; attempt < DISCOVERY_ATTEMPTS; attempt++) {
+                sendDiscoveryRequests(socket, request);
+
+                try {
+                    DatagramPacket responsePacket =
+                            new DatagramPacket(responseBuffer, responseBuffer.length);
+                    socket.receive(responsePacket);
+                    String response = new String(
+                            responsePacket.getData(),
+                            0,
+                            responsePacket.getLength(),
+                            StandardCharsets.UTF_8
+                    ).trim();
+
+                    if (response.startsWith(DISCOVERY_RESPONSE_PREFIX)) {
+                        Log.i(TAG, "DJI ROS bridge discovered at "
+                                + responsePacket.getAddress().getHostAddress());
+                        return responsePacket.getAddress();
+                    }
+                } catch (SocketTimeoutException ignored) {
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "DJI ROS bridge discovery error", e);
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+
+        return null;
+    }
+
+    private InetAddress getManualBridgeAddress() {
+        if (mRosBridgeIpEditText == null) {
+            return null;
+        }
+
+        String bridgeIp = mRosBridgeIpEditText.getText().toString().trim();
+        if (TextUtils.isEmpty(bridgeIp)) {
+            return null;
+        }
+
+        try {
+            InetAddress address = InetAddress.getByName(bridgeIp);
+            Log.i(TAG, "Using manual DJI ROS bridge IP " + address.getHostAddress());
+            return address;
+        } catch (Exception e) {
+            Log.w(TAG, "Invalid manual DJI ROS bridge IP: " + bridgeIp, e);
+            showBridgeToast("Invalid ROS bridge IP: " + bridgeIp);
+            return null;
+        }
+    }
+
+    private void retryDjiRosBridgeIfProductConnected() {
+        postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                BaseProduct product = DJISDKManager.getInstance().getProduct();
+                if (product != null && product.isConnected()) {
+                    startDjiRosBridge();
+                }
+            }
+        }, DISCOVERY_RETRY_DELAY_MS);
+    }
+
+    private void sendDiscoveryRequests(DatagramSocket socket, byte[] request) throws Exception {
+        List<InetAddress> broadcastAddresses = new ArrayList<>();
+        broadcastAddresses.add(InetAddress.getByName("255.255.255.255"));
+
+        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+        while (interfaces != null && interfaces.hasMoreElements()) {
+            NetworkInterface networkInterface = interfaces.nextElement();
+            try {
+                if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                    continue;
+                }
+
+                for (InterfaceAddress interfaceAddress : networkInterface.getInterfaceAddresses()) {
+                    InetAddress broadcast = interfaceAddress.getBroadcast();
+                    if (broadcast != null) {
+                        broadcastAddresses.add(broadcast);
+                    }
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "Skipping interface during discovery: " + networkInterface.getName(), e);
+            }
+        }
+
+        for (InetAddress broadcastAddress : broadcastAddresses) {
+            try {
+                DatagramPacket requestPacket = new DatagramPacket(
+                        request,
+                        request.length,
+                        broadcastAddress,
+                        DISCOVERY_UDP_PORT
+                );
+                socket.send(requestPacket);
+            } catch (Exception e) {
+                Log.d(TAG, "Discovery send failed for " + broadcastAddress, e);
+            }
+        }
+    }
+
+    private void showBridgeToast(final String message) {
+        post(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(getContext(), message, Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
     private synchronized void startGimbalUdpBridge() {
         if (gimbalBridgeStarted) {
             return;
@@ -772,10 +993,15 @@ public class MainContent extends RelativeLayout {
             return;
         }
 
+        InetAddress bridgeAddress = rosPcAddress;
+        if (bridgeAddress == null) {
+            Toast.makeText(getContext(), "DJI ROS bridge address is unknown", Toast.LENGTH_LONG).show();
+            return;
+        }
+
         DatagramSocket socket = null;
         try {
             socket = new DatagramSocket();
-            rosPcAddress = InetAddress.getByName(ROS_PC_IP);
             gimbalSocket = socket;
         } catch (Exception e) {
             if (socket != null) {
@@ -807,7 +1033,11 @@ public class MainContent extends RelativeLayout {
         }, 0, 100, TimeUnit.MILLISECONDS);
         gimbalBridgeStarted = true;
 
-        Toast.makeText(getContext(), "Gimbal UDP bridge started", Toast.LENGTH_LONG).show();
+        Toast.makeText(
+                getContext(),
+                "Gimbal UDP bridge started: " + bridgeAddress.getHostAddress(),
+                Toast.LENGTH_LONG
+        ).show();
     }
 
     private synchronized void stopGimbalUdpBridge() {
@@ -825,7 +1055,6 @@ public class MainContent extends RelativeLayout {
             gimbalSocket.close();
             gimbalSocket = null;
         }
-        rosPcAddress = null;
         gimbalBridgeStarted = false;
     }
 
@@ -873,6 +1102,142 @@ public class MainContent extends RelativeLayout {
             );
             socket.send(packet);
         } catch (Exception ignored) {
+        }
+    }
+
+    private synchronized void startVideoTcpBridge() {
+        if (videoBridgeStarted) {
+            return;
+        }
+
+        InetAddress bridgeAddress = rosPcAddress;
+        if (bridgeAddress == null) {
+            Toast.makeText(getContext(), "DJI ROS bridge address is unknown", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (VideoFeeder.getInstance() == null
+                || VideoFeeder.getInstance().getPrimaryVideoFeed() == null) {
+            Toast.makeText(getContext(), "Video feed is null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        videoQueue.clear();
+        videoBridgeRunning = true;
+        videoBridgeStarted = true;
+        videoFeed = VideoFeeder.getInstance().getPrimaryVideoFeed();
+        videoDataListener = new VideoFeeder.VideoDataListener() {
+            @Override
+            public void onReceive(byte[] videoBuffer, int size) {
+                if (!videoBridgeRunning || videoBuffer == null || size <= 0) {
+                    return;
+                }
+
+                byte[] packet = Arrays.copyOf(videoBuffer, size);
+                if (!videoQueue.offer(packet)) {
+                    videoQueue.poll();
+                    videoQueue.offer(packet);
+                }
+            }
+        };
+
+        videoFeed.addVideoDataListener(videoDataListener);
+        videoExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                streamVideoTcp();
+            }
+        });
+
+        Toast.makeText(
+                getContext(),
+                "Video TCP bridge started: " + bridgeAddress.getHostAddress(),
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    private synchronized void stopVideoTcpBridge() {
+        videoBridgeRunning = false;
+        videoBridgeStarted = false;
+
+        if (videoFeed != null && videoDataListener != null) {
+            videoFeed.removeVideoDataListener(videoDataListener);
+        }
+        videoFeed = null;
+        videoDataListener = null;
+        videoQueue.clear();
+        closeVideoSocket();
+    }
+
+    private void streamVideoTcp() {
+        while (videoBridgeRunning) {
+            Socket socket = null;
+            try {
+                InetAddress bridgeAddress = rosPcAddress;
+                if (bridgeAddress == null) {
+                    sleepQuietly(1000);
+                    continue;
+                }
+
+                socket = new Socket();
+                socket.connect(new InetSocketAddress(bridgeAddress, VIDEO_TCP_PORT), VIDEO_CONNECT_TIMEOUT_MS);
+                socket.setTcpNoDelay(true);
+                videoSocket = socket;
+
+                post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Toast.makeText(getContext(), "Video TCP bridge connected", Toast.LENGTH_LONG).show();
+                    }
+                });
+
+                DataOutputStream outputStream =
+                        new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                while (videoBridgeRunning && !socket.isClosed()) {
+                    byte[] packet = videoQueue.poll(500, TimeUnit.MILLISECONDS);
+                    if (packet == null) {
+                        continue;
+                    }
+
+                    outputStream.writeInt(packet.length);
+                    outputStream.write(packet);
+                    outputStream.flush();
+                }
+            } catch (Exception e) {
+                if (videoBridgeRunning) {
+                    Log.w(TAG, "Video TCP bridge error", e);
+                    sleepQuietly(1000);
+                }
+            } finally {
+                closeSocket(socket);
+                if (videoSocket == socket) {
+                    videoSocket = null;
+                }
+            }
+        }
+    }
+
+    private void closeVideoSocket() {
+        closeSocket(videoSocket);
+        videoSocket = null;
+    }
+
+    private void closeSocket(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+
+        try {
+            socket.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 }
