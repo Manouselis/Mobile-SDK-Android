@@ -30,6 +30,7 @@ import com.dji.sdk.sample.demo.bluetooth.BluetoothView;
 import com.dji.sdk.sample.internal.controller.DJISampleApplication;
 import com.dji.sdk.sample.internal.controller.MainActivity;
 import com.dji.sdk.sample.internal.model.ViewWrapper;
+import com.dji.sdk.sample.internal.utils.BridgeVideoPreviewView;
 import com.dji.sdk.sample.internal.utils.DialogUtils;
 import com.dji.sdk.sample.internal.utils.GeneralUtils;
 import com.dji.sdk.sample.internal.utils.ToastUtils;
@@ -106,6 +107,7 @@ public class MainContent extends RelativeLayout {
     private static final int DISCOVERY_TIMEOUT_MS = 1500;
     private static final int DISCOVERY_ATTEMPTS = 3;
     private static final int DISCOVERY_RETRY_DELAY_MS = 3000;
+    private static final String ROS_PC_IP_PREF_KEY = "dji_ros_pc_ip";
     private static final String DISCOVERY_REQUEST = "DJI_ROS2_BRIDGE_DISCOVER";
     private static final String DISCOVERY_RESPONSE_PREFIX = "DJI_ROS2_BRIDGE|";
     private static final int VIDEO_QUEUE_CAPACITY = 120;
@@ -117,6 +119,7 @@ public class MainContent extends RelativeLayout {
     private final BlockingQueue<byte[]> videoQueue = new ArrayBlockingQueue<>(VIDEO_QUEUE_CAPACITY);
     private volatile DatagramSocket gimbalSocket;
     private volatile InetAddress rosPcAddress;
+    private volatile String manualRosPcIp = "";
     private volatile boolean bridgeStartupRunning = false;
     private int bridgeStartGeneration = 0;
     private volatile boolean gimbalBridgeStarted = false;
@@ -154,6 +157,7 @@ public class MainContent extends RelativeLayout {
     private Button getmBtnRegisterAppForLDM;
     private Button mBtnOpen;
     private Button mBtnBluetooth;
+    private BridgeVideoPreviewView mBridgePreviewFeed;
     private ViewWrapper componentList =
             new ViewWrapper(new DemoListView(getContext()), R.string.activity_component_list);
     private ViewWrapper bluetoothView;
@@ -235,6 +239,9 @@ public class MainContent extends RelativeLayout {
         mBtnOpen = (Button) findViewById(R.id.btn_open);
         mBridgeModeEditText = (EditText) findViewById(R.id.edittext_bridge_ip);
         mRosBridgeIpEditText = (EditText) findViewById(R.id.edittext_ros_bridge_ip);
+        manualRosPcIp = getSavedRosPcIp();
+        mRosBridgeIpEditText.setText(manualRosPcIp);
+        mBridgePreviewFeed = null;
         mBtnBluetooth = (Button) findViewById(R.id.btn_bluetooth);
         mCheckboxFirmware = (CheckBox) findViewById(R.id.checkbox_firmware);
 
@@ -318,6 +325,45 @@ public class MainContent extends RelativeLayout {
                 }
             }
         });
+        mRosBridgeIpEditText.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override
+            public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                if (actionId == EditorInfo.IME_ACTION_SEARCH
+                        || actionId == EditorInfo.IME_ACTION_DONE
+                        || event != null
+                        && event.getAction() == KeyEvent.ACTION_DOWN
+                        && event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
+                    if (event != null && event.isShiftPressed()) {
+                        return false;
+                    } else {
+                        handleRosPcIpTextChange();
+                    }
+                }
+                return false;
+            }
+        });
+        mRosBridgeIpEditText.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (s != null && s.toString().contains("\n")) {
+                    final String currentText = mRosBridgeIpEditText.getText().toString();
+                    mRosBridgeIpEditText.setText(currentText.substring(0, currentText.indexOf('\n')));
+                    handleRosPcIpTextChange();
+                } else if (s != null) {
+                    manualRosPcIp = s.toString().trim();
+                    saveRosPcIp(manualRosPcIp);
+                }
+            }
+        });
         ((TextView) findViewById(R.id.text_version)).setText(getResources().getString(R.string.sdk_version,
                 DJISDKManager.getInstance().getRegistrationSDKVersion()
                         + " Debug:"
@@ -331,6 +377,30 @@ public class MainContent extends RelativeLayout {
         if (!TextUtils.isEmpty(bridgeIP)) {
             ToastUtils.setResultToToast("BridgeMode ON!\nIP: " + bridgeIP);
         }
+    }
+
+    private void handleRosPcIpTextChange() {
+        final String rosPcIp = mRosBridgeIpEditText.getText().toString().trim();
+        manualRosPcIp = rosPcIp;
+        saveRosPcIp(rosPcIp);
+        if (!TextUtils.isEmpty(rosPcIp)) {
+            ToastUtils.setResultToToast("ROS bridge IP set:\n" + rosPcIp);
+            retryDjiRosBridgeIfProductConnected();
+        }
+    }
+
+    private String getSavedRosPcIp() {
+        return getContext()
+                .getSharedPreferences(getContext().getPackageName(), Context.MODE_PRIVATE)
+                .getString(ROS_PC_IP_PREF_KEY, "");
+    }
+
+    private void saveRosPcIp(String rosPcIp) {
+        getContext()
+                .getSharedPreferences(getContext().getPackageName(), Context.MODE_PRIVATE)
+                .edit()
+                .putString(ROS_PC_IP_PREF_KEY, rosPcIp)
+                .apply();
     }
 
     @Override
@@ -808,7 +878,7 @@ public class MainContent extends RelativeLayout {
                             bridgeStartupRunning = false;
                         }
                     }
-                    showBridgeToast("DJI ROS bridge discovery failed");
+                    showBridgeToast("Discovery failed. Enter ROS PC IP.");
                     retryDjiRosBridgeIfProductConnected();
                     return;
                 }
@@ -899,11 +969,7 @@ public class MainContent extends RelativeLayout {
     }
 
     private InetAddress getManualBridgeAddress() {
-        if (mRosBridgeIpEditText == null) {
-            return null;
-        }
-
-        String bridgeIp = mRosBridgeIpEditText.getText().toString().trim();
+        String bridgeIp = manualRosPcIp;
         if (TextUtils.isEmpty(bridgeIp)) {
             return null;
         }
@@ -911,6 +977,7 @@ public class MainContent extends RelativeLayout {
         try {
             InetAddress address = InetAddress.getByName(bridgeIp);
             Log.i(TAG, "Using manual DJI ROS bridge IP " + address.getHostAddress());
+            showBridgeToast("Using ROS PC IP: " + address.getHostAddress());
             return address;
         } catch (Exception e) {
             Log.w(TAG, "Invalid manual DJI ROS bridge IP: " + bridgeIp, e);
@@ -1154,6 +1221,12 @@ public class MainContent extends RelativeLayout {
             primaryVideoDataListener = createVideoDataListener("primary");
             primaryVideoActiveStatusListener = createVideoActiveStatusListener("primary");
             registerVideoFeed("primary", primaryVideoFeed, primaryVideoDataListener, primaryVideoActiveStatusListener);
+            BridgeVideoPreviewView bridgePreviewFeed = getBridgePreviewFeed();
+            if (bridgePreviewFeed != null) {
+                bridgePreviewFeed.registerLiveVideo(primaryVideoFeed, true);
+                scheduleBridgePreviewKeyFrameReset();
+                Log.i(TAG, "Registered hidden preview activator on primary video feed");
+            }
         }
 
         if (secondaryVideoFeed != null) {
@@ -1201,6 +1274,9 @@ public class MainContent extends RelativeLayout {
         if (transcodedVideoFeed != null && transcodedVideoDataListener != null) {
             transcodedVideoFeed.removeVideoDataListener(transcodedVideoDataListener);
         }
+        if (mBridgePreviewFeed != null) {
+            mBridgePreviewFeed.unregisterLiveVideo();
+        }
         if (primaryVideoFeed != null && primaryVideoActiveStatusListener != null) {
             primaryVideoFeed.removeVideoActiveStatusListener(primaryVideoActiveStatusListener);
         }
@@ -1225,6 +1301,38 @@ public class MainContent extends RelativeLayout {
         if (activeVideoBridge == this) {
             activeVideoBridge = null;
         }
+    }
+
+    private void scheduleBridgePreviewKeyFrameReset() {
+        postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                resetBridgePreviewKeyFrame();
+            }
+        }, 500);
+        postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                resetBridgePreviewKeyFrame();
+            }
+        }, 2000);
+    }
+
+    private void resetBridgePreviewKeyFrame() {
+        BridgeVideoPreviewView bridgePreviewFeed = getBridgePreviewFeed();
+        if (videoBridgeRunning && bridgePreviewFeed != null) {
+            bridgePreviewFeed.changeSourceResetKeyFrame();
+        }
+    }
+
+    private BridgeVideoPreviewView getBridgePreviewFeed() {
+        if (mBridgePreviewFeed == null && getContext() instanceof Activity) {
+            mBridgePreviewFeed =
+                    (BridgeVideoPreviewView) ((Activity) getContext()).findViewById(
+                            R.id.video_bridge_preview_feed
+                    );
+        }
+        return mBridgePreviewFeed;
     }
 
     public static void forwardPreviewVideoPacket(String feedName, byte[] videoBuffer, int size) {
@@ -1310,6 +1418,15 @@ public class MainContent extends RelativeLayout {
                     showBridgeToast("Video feed selected: " + feedName);
                 }
                 selectedFeed = selectedVideoFeedName;
+            }
+        }
+
+        if (feedName.startsWith("preview-") && !selectedFeed.startsWith("preview-")) {
+            synchronized (this) {
+                selectedVideoFeedName = feedName;
+                selectedFeed = feedName;
+                Log.i(TAG, "DJI video bridge switched to " + feedName + " feed");
+                showBridgeToast("Video feed selected: " + feedName);
             }
         }
 

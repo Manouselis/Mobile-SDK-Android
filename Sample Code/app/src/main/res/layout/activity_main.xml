@@ -11,5 +11,13 @@
         android:layout_gravity="center">
         <include layout="@layout/content_main"/>
     </FrameLayout>
-</FrameLayout>
 
+    <com.dji.sdk.sample.internal.utils.BridgeVideoPreviewView
+        android:id="@+id/video_bridge_preview_feed"
+        android:layout_width="160dp"
+        android:layout_height="90dp"
+        android:layout_gravity="end|bottom"
+        android:alpha="0.01"
+        android:clickable="false"
+        android:focusable="false"/>
+</FrameLayout>

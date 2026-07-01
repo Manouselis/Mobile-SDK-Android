@@ -29,6 +29,7 @@ public class VideoFeedView extends SurfaceView {
     private final static String TAG = "DULFpvWidget";
     private DJICodecManager codecManager = null;
     private VideoFeeder.VideoDataListener videoDataListener = null;
+    private VideoFeeder.VideoFeed registeredVideoFeed = null;
     private int videoWidth;
     private int videoHeight;
     private boolean isPrimaryVideoFeed;
@@ -70,15 +71,7 @@ public class VideoFeedView extends SurfaceView {
         surfaceHolder.addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(@NonNull SurfaceHolder surfaceHolder) {
-                if (codecManager == null) {
-                    codecManager = new DJICodecManager(context,
-                            surfaceHolder,
-                            getWidth(),
-                            getHeight(),
-                            isPrimaryVideoFeed
-                                    ? UsbAccessoryService.VideoStreamSource.Camera
-                                    : UsbAccessoryService.VideoStreamSource.Fpv);
-                }
+                createCodecManager();
             }
 
             @Override
@@ -88,11 +81,7 @@ public class VideoFeedView extends SurfaceView {
 
             @Override
             public void surfaceDestroyed(@NonNull SurfaceHolder surfaceHolder) {
-                if (codecManager != null) {
-                    codecManager.cleanSurface();
-                    codecManager.destroyCodec();
-                    codecManager = null;
-                }
+                destroyCodecManager();
             }
         });
 
@@ -139,13 +128,33 @@ public class VideoFeedView extends SurfaceView {
     }
 
     public VideoFeeder.VideoDataListener registerLiveVideo(VideoFeeder.VideoFeed videoFeed, boolean isPrimary) {
+        boolean sourceChanged = isPrimaryVideoFeed != isPrimary;
         isPrimaryVideoFeed = isPrimary;
+
+        if (sourceChanged && codecManager != null) {
+            destroyCodecManager();
+            createCodecManager();
+        }
+
+        if (videoDataListener != null && videoFeed != null && registeredVideoFeed != videoFeed) {
+            unregisterLiveVideo();
+        }
 
         if (videoDataListener != null && videoFeed != null && !videoFeed.getListeners().contains(videoDataListener)) {
             videoFeed.addVideoDataListener(videoDataListener);
-            return videoDataListener;
         }
-        return null;
+        registeredVideoFeed = videoFeed;
+        return videoDataListener;
+    }
+
+    public void unregisterLiveVideo() {
+        if (registeredVideoFeed != null && videoDataListener != null) {
+            try {
+                registeredVideoFeed.removeVideoDataListener(videoDataListener);
+            } catch (Exception ignored) {
+            }
+        }
+        registeredVideoFeed = null;
     }
 
     public void changeSourceResetKeyFrame() {
@@ -157,9 +166,35 @@ public class VideoFeedView extends SurfaceView {
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
+        unregisterLiveVideo();
+        destroyCodecManager();
         if (subscription != null && !subscription.isUnsubscribed()) {
             subscription.unsubscribe();
         }
-        VideoFeeder.getInstance().destroy();
+    }
+
+    private void createCodecManager() {
+        if (codecManager != null || surfaceHolder == null || surfaceHolder.getSurface() == null
+                || !surfaceHolder.getSurface().isValid()) {
+            return;
+        }
+
+        codecManager = new DJICodecManager(
+                getContext(),
+                surfaceHolder,
+                Math.max(getWidth(), 1),
+                Math.max(getHeight(), 1),
+                isPrimaryVideoFeed
+                        ? UsbAccessoryService.VideoStreamSource.Camera
+                        : UsbAccessoryService.VideoStreamSource.Fpv
+        );
+    }
+
+    private void destroyCodecManager() {
+        if (codecManager != null) {
+            codecManager.cleanSurface();
+            codecManager.destroyCodec();
+            codecManager = null;
+        }
     }
 }
