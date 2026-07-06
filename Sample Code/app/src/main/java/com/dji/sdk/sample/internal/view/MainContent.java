@@ -1394,25 +1394,7 @@ public class MainContent extends RelativeLayout {
             updateRtkState(getKeyValue(keyManager, rtkStateKey));
         }
 
-        LocationCoordinate3D aircraftLocation = latestAircraftLocation;
-        if (aircraftLocation == null) {
-            return;
-        }
-
-        double latitude;
-        double longitude;
-        try {
-            latitude = aircraftLocation.getLatitude();
-            longitude = aircraftLocation.getLongitude();
-        } catch (Exception e) {
-            return;
-        }
-
-        if (!isFinite(latitude) || !isFinite(longitude)) {
-            return;
-        }
-
-        sendPositionUdp(buildPositionJson(System.currentTimeMillis(), aircraftLocation));
+        sendPositionUdp(buildPositionJson(System.currentTimeMillis(), latestAircraftLocation));
     }
 
     private Object getKeyValue(KeyManager keyManager, DJIKey key) {
@@ -1478,10 +1460,31 @@ public class MainContent extends RelativeLayout {
 
     private String buildPositionJson(long now, LocationCoordinate3D aircraftLocation) {
         StringBuilder builder = new StringBuilder(512);
+        boolean positionValid = false;
+        String positionStatus = "waiting_for_aircraft_location";
+        double latitude = Double.NaN;
+        double longitude = Double.NaN;
+        double altitude = Double.NaN;
+
+        if (aircraftLocation != null) {
+            try {
+                latitude = aircraftLocation.getLatitude();
+                longitude = aircraftLocation.getLongitude();
+                altitude = aircraftLocation.getAltitude();
+                positionValid = isFinite(latitude) && isFinite(longitude);
+                positionStatus = positionValid ? "ok" : "invalid_aircraft_location";
+            } catch (Exception e) {
+                positionStatus = "aircraft_location_read_failed";
+            }
+        }
+
         builder.append("{\"t\":").append(now);
-        appendJsonDouble(builder, "lat", aircraftLocation.getLatitude(), 8);
-        appendJsonDouble(builder, "lon", aircraftLocation.getLongitude(), 8);
-        appendJsonDouble(builder, "alt", aircraftLocation.getAltitude(), 3);
+        appendJsonString(builder, "source", "flight_controller");
+        appendJsonBoolean(builder, "position_valid", positionValid);
+        appendJsonString(builder, "position_status", positionStatus);
+        appendJsonDouble(builder, "lat", latitude, 8);
+        appendJsonDouble(builder, "lon", longitude, 8);
+        appendJsonDouble(builder, "alt", altitude, 3);
         appendJsonFloat(builder, "vx", latestVelocityX, 3);
         appendJsonFloat(builder, "vy", latestVelocityY, 3);
         appendJsonFloat(builder, "vz", latestVelocityZ, 3);
