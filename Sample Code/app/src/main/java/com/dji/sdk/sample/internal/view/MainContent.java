@@ -44,11 +44,15 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import dji.common.error.DJIError;
 import dji.common.error.DJISDKError;
+import dji.common.flightcontroller.LocationCoordinate3D;
+import dji.common.flightcontroller.RTKState;
 import dji.common.gimbal.Attitude;
+import dji.common.model.LocationCoordinate2D;
 import dji.common.realname.AppActivationState;
 import dji.common.useraccount.UserAccountState;
 import dji.common.util.CommonCallbacks;
 import dji.keysdk.DJIKey;
+import dji.keysdk.FlightControllerKey;
 import dji.keysdk.GimbalKey;
 import dji.keysdk.KeyManager;
 import dji.keysdk.ProductKey;
@@ -104,6 +108,7 @@ public class MainContent extends RelativeLayout {
     private static final int GIMBAL_UDP_PORT = 5005;
     private static final int VIDEO_TCP_PORT = 5006;
     private static final int DISCOVERY_UDP_PORT = 5007;
+    private static final int POSITION_UDP_PORT = 5008;
     private static final int DISCOVERY_TIMEOUT_MS = 1500;
     private static final int DISCOVERY_ATTEMPTS = 3;
     private static final int DISCOVERY_RETRY_DELAY_MS = 3000;
@@ -118,15 +123,39 @@ public class MainContent extends RelativeLayout {
     private final ExecutorService videoExecutor = Executors.newSingleThreadExecutor();
     private final BlockingQueue<byte[]> videoQueue = new ArrayBlockingQueue<>(VIDEO_QUEUE_CAPACITY);
     private volatile DatagramSocket gimbalSocket;
+    private volatile DatagramSocket positionSocket;
     private volatile InetAddress rosPcAddress;
     private volatile String manualRosPcIp = "";
     private volatile boolean bridgeStartupRunning = false;
     private int bridgeStartGeneration = 0;
     private volatile boolean gimbalBridgeStarted = false;
+    private volatile boolean positionBridgeStarted = false;
     private DJIKey gimbalAttitudeKey;
     private KeyListener gimbalAttitudeUpdater;
     private ScheduledFuture<?> gimbalSendTask;
     private volatile Attitude latestGimbalAttitude;
+    private DJIKey aircraftLocationKey;
+    private DJIKey velocityXKey;
+    private DJIKey velocityYKey;
+    private DJIKey velocityZKey;
+    private DJIKey satelliteCountKey;
+    private DJIKey gpsSignalLevelKey;
+    private DJIKey rtkStateKey;
+    private KeyListener aircraftLocationUpdater;
+    private KeyListener velocityXUpdater;
+    private KeyListener velocityYUpdater;
+    private KeyListener velocityZUpdater;
+    private KeyListener satelliteCountUpdater;
+    private KeyListener gpsSignalLevelUpdater;
+    private KeyListener rtkStateUpdater;
+    private ScheduledFuture<?> positionSendTask;
+    private volatile LocationCoordinate3D latestAircraftLocation;
+    private volatile Float latestVelocityX;
+    private volatile Float latestVelocityY;
+    private volatile Float latestVelocityZ;
+    private volatile Integer latestSatelliteCount;
+    private volatile Object latestGpsSignalLevel;
+    private volatile RTKState latestRtkState;
     private VideoFeeder.VideoFeed primaryVideoFeed;
     private VideoFeeder.VideoFeed secondaryVideoFeed;
     private VideoFeeder.VideoFeed transcodedVideoFeed;
@@ -861,7 +890,7 @@ public class MainContent extends RelativeLayout {
     //endregion
 
     private synchronized void startDjiRosBridge() {
-        if (bridgeStartupRunning || gimbalBridgeStarted || videoBridgeStarted) {
+        if (bridgeStartupRunning || gimbalBridgeStarted || positionBridgeStarted || videoBridgeStarted) {
             return;
         }
 
@@ -900,6 +929,7 @@ public class MainContent extends RelativeLayout {
                         }
 
                         startGimbalUdpBridge();
+                        startPositionUdpBridge();
                         startVideoTcpBridge();
 
                         synchronized (MainContent.this) {
@@ -917,6 +947,7 @@ public class MainContent extends RelativeLayout {
         bridgeStartGeneration++;
         bridgeStartupRunning = false;
         stopGimbalUdpBridge();
+        stopPositionUdpBridge();
         stopVideoTcpBridge();
         rosPcAddress = null;
     }
@@ -1175,6 +1206,436 @@ public class MainContent extends RelativeLayout {
                     data.length,
                     address,
                     GIMBAL_UDP_PORT
+            );
+            socket.send(packet);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private synchronized void startPositionUdpBridge() {
+        if (positionBridgeStarted) {
+            return;
+        }
+
+        BaseProduct product = DJISDKManager.getInstance().getProduct();
+        if (!(product instanceof Aircraft)) {
+            Toast.makeText(getContext(), "No aircraft connected yet", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        KeyManager keyManager = KeyManager.getInstance();
+        if (keyManager == null) {
+            Toast.makeText(getContext(), "KeyManager is null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        InetAddress bridgeAddress = rosPcAddress;
+        if (bridgeAddress == null) {
+            Toast.makeText(getContext(), "DJI ROS bridge address is unknown", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        try {
+            positionSocket = new DatagramSocket();
+            aircraftLocationKey = FlightControllerKey.create(FlightControllerKey.AIRCRAFT_LOCATION);
+            velocityXKey = FlightControllerKey.create(FlightControllerKey.VELOCITY_X);
+            velocityYKey = FlightControllerKey.create(FlightControllerKey.VELOCITY_Y);
+            velocityZKey = FlightControllerKey.create(FlightControllerKey.VELOCITY_Z);
+            satelliteCountKey = FlightControllerKey.create(FlightControllerKey.SATELLITE_COUNT);
+            gpsSignalLevelKey = FlightControllerKey.create(FlightControllerKey.GPS_SIGNAL_LEVEL);
+            rtkStateKey = FlightControllerKey.create(FlightControllerKey.RTK_STATE);
+
+            updateAircraftLocation(keyManager.getValue(aircraftLocationKey));
+            updateVelocityX(keyManager.getValue(velocityXKey));
+            updateVelocityY(keyManager.getValue(velocityYKey));
+            updateVelocityZ(keyManager.getValue(velocityZKey));
+            updateSatelliteCount(keyManager.getValue(satelliteCountKey));
+            updateGpsSignalLevel(keyManager.getValue(gpsSignalLevelKey));
+            updateRtkState(keyManager.getValue(rtkStateKey));
+
+            aircraftLocationUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateAircraftLocation(newValue);
+                }
+            };
+            velocityXUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateVelocityX(newValue);
+                }
+            };
+            velocityYUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateVelocityY(newValue);
+                }
+            };
+            velocityZUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateVelocityZ(newValue);
+                }
+            };
+            satelliteCountUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateSatelliteCount(newValue);
+                }
+            };
+            gpsSignalLevelUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateGpsSignalLevel(newValue);
+                }
+            };
+            rtkStateUpdater = new KeyListener() {
+                @Override
+                public void onValueChange(Object oldValue, Object newValue) {
+                    updateRtkState(newValue);
+                }
+            };
+
+            keyManager.addListener(aircraftLocationKey, aircraftLocationUpdater);
+            keyManager.addListener(velocityXKey, velocityXUpdater);
+            keyManager.addListener(velocityYKey, velocityYUpdater);
+            keyManager.addListener(velocityZKey, velocityZUpdater);
+            keyManager.addListener(satelliteCountKey, satelliteCountUpdater);
+            keyManager.addListener(gpsSignalLevelKey, gpsSignalLevelUpdater);
+            keyManager.addListener(rtkStateKey, rtkStateUpdater);
+
+            positionSendTask = udpExecutor.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    pollAndSendPositionTelemetry();
+                }
+            }, 0, 100, TimeUnit.MILLISECONDS);
+
+            positionBridgeStarted = true;
+        } catch (Exception e) {
+            Log.w(TAG, "Position UDP bridge init failed", e);
+            stopPositionUdpBridge();
+            Toast.makeText(getContext(), "Position UDP init failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Toast.makeText(
+                getContext(),
+                "Position UDP bridge started: " + bridgeAddress.getHostAddress(),
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    private synchronized void stopPositionUdpBridge() {
+        if (positionSendTask != null) {
+            positionSendTask.cancel(true);
+            positionSendTask = null;
+        }
+
+        KeyManager keyManager = KeyManager.getInstance();
+        removeKeyListener(keyManager, aircraftLocationUpdater);
+        removeKeyListener(keyManager, velocityXUpdater);
+        removeKeyListener(keyManager, velocityYUpdater);
+        removeKeyListener(keyManager, velocityZUpdater);
+        removeKeyListener(keyManager, satelliteCountUpdater);
+        removeKeyListener(keyManager, gpsSignalLevelUpdater);
+        removeKeyListener(keyManager, rtkStateUpdater);
+
+        aircraftLocationKey = null;
+        velocityXKey = null;
+        velocityYKey = null;
+        velocityZKey = null;
+        satelliteCountKey = null;
+        gpsSignalLevelKey = null;
+        rtkStateKey = null;
+        aircraftLocationUpdater = null;
+        velocityXUpdater = null;
+        velocityYUpdater = null;
+        velocityZUpdater = null;
+        satelliteCountUpdater = null;
+        gpsSignalLevelUpdater = null;
+        rtkStateUpdater = null;
+        latestAircraftLocation = null;
+        latestVelocityX = null;
+        latestVelocityY = null;
+        latestVelocityZ = null;
+        latestSatelliteCount = null;
+        latestGpsSignalLevel = null;
+        latestRtkState = null;
+
+        if (positionSocket != null) {
+            positionSocket.close();
+            positionSocket = null;
+        }
+        positionBridgeStarted = false;
+    }
+
+    private void removeKeyListener(KeyManager keyManager, KeyListener keyListener) {
+        if (keyManager == null || keyListener == null) {
+            return;
+        }
+
+        try {
+            keyManager.removeListener(keyListener);
+        } catch (Exception e) {
+            Log.d(TAG, "Position key listener removal failed", e);
+        }
+    }
+
+    private void pollAndSendPositionTelemetry() {
+        KeyManager keyManager = KeyManager.getInstance();
+        if (keyManager != null) {
+            updateAircraftLocation(getKeyValue(keyManager, aircraftLocationKey));
+            updateVelocityX(getKeyValue(keyManager, velocityXKey));
+            updateVelocityY(getKeyValue(keyManager, velocityYKey));
+            updateVelocityZ(getKeyValue(keyManager, velocityZKey));
+            updateSatelliteCount(getKeyValue(keyManager, satelliteCountKey));
+            updateGpsSignalLevel(getKeyValue(keyManager, gpsSignalLevelKey));
+            updateRtkState(getKeyValue(keyManager, rtkStateKey));
+        }
+
+        LocationCoordinate3D aircraftLocation = latestAircraftLocation;
+        if (aircraftLocation == null) {
+            return;
+        }
+
+        double latitude;
+        double longitude;
+        try {
+            latitude = aircraftLocation.getLatitude();
+            longitude = aircraftLocation.getLongitude();
+        } catch (Exception e) {
+            return;
+        }
+
+        if (!isFinite(latitude) || !isFinite(longitude)) {
+            return;
+        }
+
+        sendPositionUdp(buildPositionJson(System.currentTimeMillis(), aircraftLocation));
+    }
+
+    private Object getKeyValue(KeyManager keyManager, DJIKey key) {
+        if (keyManager == null || key == null) {
+            return null;
+        }
+
+        try {
+            return keyManager.getValue(key);
+        } catch (Exception e) {
+            Log.d(TAG, "Position key read failed", e);
+            return null;
+        }
+    }
+
+    private void updateAircraftLocation(Object value) {
+        if (value instanceof LocationCoordinate3D) {
+            latestAircraftLocation = (LocationCoordinate3D) value;
+        }
+    }
+
+    private void updateVelocityX(Object value) {
+        latestVelocityX = asFloat(value);
+    }
+
+    private void updateVelocityY(Object value) {
+        latestVelocityY = asFloat(value);
+    }
+
+    private void updateVelocityZ(Object value) {
+        latestVelocityZ = asFloat(value);
+    }
+
+    private void updateSatelliteCount(Object value) {
+        latestSatelliteCount = asInteger(value);
+    }
+
+    private void updateGpsSignalLevel(Object value) {
+        if (value != null) {
+            latestGpsSignalLevel = value;
+        }
+    }
+
+    private void updateRtkState(Object value) {
+        if (value instanceof RTKState) {
+            latestRtkState = (RTKState) value;
+        }
+    }
+
+    private Float asFloat(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).floatValue();
+        }
+        return null;
+    }
+
+    private Integer asInteger(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        return null;
+    }
+
+    private String buildPositionJson(long now, LocationCoordinate3D aircraftLocation) {
+        StringBuilder builder = new StringBuilder(512);
+        builder.append("{\"t\":").append(now);
+        appendJsonDouble(builder, "lat", aircraftLocation.getLatitude(), 8);
+        appendJsonDouble(builder, "lon", aircraftLocation.getLongitude(), 8);
+        appendJsonDouble(builder, "alt", aircraftLocation.getAltitude(), 3);
+        appendJsonFloat(builder, "vx", latestVelocityX, 3);
+        appendJsonFloat(builder, "vy", latestVelocityY, 3);
+        appendJsonFloat(builder, "vz", latestVelocityZ, 3);
+        appendJsonInt(builder, "satellites", latestSatelliteCount);
+        appendJsonString(builder, "gps_signal", safeName(latestGpsSignalLevel));
+        appendRtkJson(builder, latestRtkState);
+        builder.append("}");
+        return builder.toString();
+    }
+
+    private void appendRtkJson(StringBuilder builder, RTKState rtkState) {
+        if (rtkState == null) {
+            appendJsonBoolean(builder, "rtk_available", false);
+            return;
+        }
+
+        appendJsonBoolean(builder, "rtk_available", true);
+        try {
+            appendJsonBoolean(builder, "rtk_used", rtkState.isRTKBeingUsed());
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_used");
+        }
+        try {
+            appendJsonString(builder, "rtk_solution", safeName(rtkState.getPositioningSolution()));
+        } catch (Exception e) {
+            appendJsonString(builder, "rtk_solution", null);
+        }
+        try {
+            appendJsonBoolean(builder, "rtk_heading_valid", rtkState.isHeadingValid());
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_heading_valid");
+        }
+        try {
+            appendJsonDouble(builder, "rtk_heading", rtkState.getFusionHeading(), 3);
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_heading");
+        }
+
+        LocationCoordinate2D fusionLocation = null;
+        try {
+            fusionLocation = rtkState.getFusionMobileStationLocation();
+        } catch (Exception e) {
+            Log.d(TAG, "RTK fusion location read failed", e);
+        }
+
+        if (fusionLocation != null) {
+            appendJsonDouble(builder, "rtk_lat", fusionLocation.getLatitude(), 8);
+            appendJsonDouble(builder, "rtk_lon", fusionLocation.getLongitude(), 8);
+        } else {
+            appendJsonNull(builder, "rtk_lat");
+            appendJsonNull(builder, "rtk_lon");
+        }
+
+        try {
+            appendJsonDouble(builder, "rtk_alt", rtkState.getFusionMobileStationAltitude(), 3);
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_alt");
+        }
+        try {
+            appendJsonInt(builder, "rtk_satellites", rtkState.getSatelliteCount());
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_satellites");
+        }
+        try {
+            appendJsonInt(builder, "rtk_mobile_station_1_satellites", rtkState.getMobileStation1SatelliteCount());
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_mobile_station_1_satellites");
+        }
+        try {
+            appendJsonInt(builder, "rtk_mobile_station_2_satellites", rtkState.getMobileStation2SatelliteCount());
+        } catch (Exception e) {
+            appendJsonNull(builder, "rtk_mobile_station_2_satellites");
+        }
+    }
+
+    private void appendJsonString(StringBuilder builder, String name, String value) {
+        builder.append(",\"").append(name).append("\":");
+        if (TextUtils.isEmpty(value)) {
+            builder.append("null");
+            return;
+        }
+        builder.append("\"").append(escapeJson(value)).append("\"");
+    }
+
+    private void appendJsonInt(StringBuilder builder, String name, Integer value) {
+        builder.append(",\"").append(name).append("\":");
+        if (value == null) {
+            builder.append("null");
+        } else {
+            builder.append(value);
+        }
+    }
+
+    private void appendJsonInt(StringBuilder builder, String name, int value) {
+        builder.append(",\"").append(name).append("\":").append(value);
+    }
+
+    private void appendJsonFloat(StringBuilder builder, String name, Float value, int decimals) {
+        builder.append(",\"").append(name).append("\":");
+        if (value == null || !isFinite(value)) {
+            builder.append("null");
+        } else {
+            builder.append(String.format(Locale.US, "%." + decimals + "f", value));
+        }
+    }
+
+    private void appendJsonDouble(StringBuilder builder, String name, double value, int decimals) {
+        builder.append(",\"").append(name).append("\":");
+        if (!isFinite(value)) {
+            builder.append("null");
+        } else {
+            builder.append(String.format(Locale.US, "%." + decimals + "f", value));
+        }
+    }
+
+    private void appendJsonBoolean(StringBuilder builder, String name, boolean value) {
+        builder.append(",\"").append(name).append("\":").append(value);
+    }
+
+    private void appendJsonNull(StringBuilder builder, String name) {
+        builder.append(",\"").append(name).append("\":null");
+    }
+
+    private boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
+    }
+
+    private String safeName(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Enum) {
+            return ((Enum<?>) value).name();
+        }
+        return String.valueOf(value);
+    }
+
+    private String escapeJson(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private void sendPositionUdp(String message) {
+        try {
+            DatagramSocket socket = positionSocket;
+            InetAddress address = rosPcAddress;
+            if (socket == null || address == null || socket.isClosed()) {
+                return;
+            }
+            byte[] data = message.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket packet = new DatagramPacket(
+                    data,
+                    data.length,
+                    address,
+                    POSITION_UDP_PORT
             );
             socket.send(packet);
         } catch (Exception ignored) {
