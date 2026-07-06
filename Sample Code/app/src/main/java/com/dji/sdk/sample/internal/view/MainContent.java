@@ -1245,13 +1245,13 @@ public class MainContent extends RelativeLayout {
             gpsSignalLevelKey = FlightControllerKey.create(FlightControllerKey.GPS_SIGNAL_LEVEL);
             rtkStateKey = FlightControllerKey.create(FlightControllerKey.RTK_STATE);
 
-            updateAircraftLocation(keyManager.getValue(aircraftLocationKey));
-            updateVelocityX(keyManager.getValue(velocityXKey));
-            updateVelocityY(keyManager.getValue(velocityYKey));
-            updateVelocityZ(keyManager.getValue(velocityZKey));
-            updateSatelliteCount(keyManager.getValue(satelliteCountKey));
-            updateGpsSignalLevel(keyManager.getValue(gpsSignalLevelKey));
-            updateRtkState(keyManager.getValue(rtkStateKey));
+            updateAircraftLocation(getKeyValue(keyManager, aircraftLocationKey));
+            updateVelocityX(getKeyValue(keyManager, velocityXKey));
+            updateVelocityY(getKeyValue(keyManager, velocityYKey));
+            updateVelocityZ(getKeyValue(keyManager, velocityZKey));
+            updateSatelliteCount(getKeyValue(keyManager, satelliteCountKey));
+            updateGpsSignalLevel(getKeyValue(keyManager, gpsSignalLevelKey));
+            updateRtkState(getKeyValue(keyManager, rtkStateKey));
 
             aircraftLocationUpdater = new KeyListener() {
                 @Override
@@ -1296,13 +1296,13 @@ public class MainContent extends RelativeLayout {
                 }
             };
 
-            keyManager.addListener(aircraftLocationKey, aircraftLocationUpdater);
-            keyManager.addListener(velocityXKey, velocityXUpdater);
-            keyManager.addListener(velocityYKey, velocityYUpdater);
-            keyManager.addListener(velocityZKey, velocityZUpdater);
-            keyManager.addListener(satelliteCountKey, satelliteCountUpdater);
-            keyManager.addListener(gpsSignalLevelKey, gpsSignalLevelUpdater);
-            keyManager.addListener(rtkStateKey, rtkStateUpdater);
+            addKeyListener(keyManager, aircraftLocationKey, aircraftLocationUpdater, "aircraft_location");
+            addKeyListener(keyManager, velocityXKey, velocityXUpdater, "velocity_x");
+            addKeyListener(keyManager, velocityYKey, velocityYUpdater, "velocity_y");
+            addKeyListener(keyManager, velocityZKey, velocityZUpdater, "velocity_z");
+            addKeyListener(keyManager, satelliteCountKey, satelliteCountUpdater, "satellite_count");
+            addKeyListener(keyManager, gpsSignalLevelKey, gpsSignalLevelUpdater, "gps_signal_level");
+            addKeyListener(keyManager, rtkStateKey, rtkStateUpdater, "rtk_state");
 
             positionSendTask = udpExecutor.scheduleAtFixedRate(new Runnable() {
                 @Override
@@ -1324,6 +1324,23 @@ public class MainContent extends RelativeLayout {
                 "Position UDP bridge started: " + bridgeAddress.getHostAddress(),
                 Toast.LENGTH_LONG
         ).show();
+    }
+
+    private void addKeyListener(
+            KeyManager keyManager,
+            DJIKey key,
+            KeyListener keyListener,
+            String name
+    ) {
+        if (keyManager == null || key == null || keyListener == null) {
+            return;
+        }
+
+        try {
+            keyManager.addListener(key, keyListener);
+        } catch (Exception e) {
+            Log.d(TAG, "Position key listener add failed for " + name, e);
+        }
     }
 
     private synchronized void stopPositionUdpBridge() {
