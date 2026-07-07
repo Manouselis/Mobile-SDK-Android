@@ -38,12 +38,15 @@ import com.squareup.otto.Subscribe;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import dji.common.error.DJIError;
 import dji.common.error.DJISDKError;
+import dji.common.camera.SettingsDefinitions;
 import dji.common.flightcontroller.LocationCoordinate3D;
 import dji.common.flightcontroller.RTKState;
 import dji.common.gimbal.Attitude;
@@ -52,11 +55,13 @@ import dji.common.realname.AppActivationState;
 import dji.common.useraccount.UserAccountState;
 import dji.common.util.CommonCallbacks;
 import dji.keysdk.DJIKey;
+import dji.keysdk.CameraKey;
 import dji.keysdk.FlightControllerKey;
 import dji.keysdk.GimbalKey;
 import dji.keysdk.KeyManager;
 import dji.keysdk.ProductKey;
 import dji.keysdk.callback.KeyListener;
+import dji.internal.logics.CommonUtil;
 import dji.log.DJILog;
 import dji.log.GlobalConfig;
 import dji.sdk.base.BaseComponent;
@@ -109,6 +114,7 @@ public class MainContent extends RelativeLayout {
     private static final int VIDEO_TCP_PORT = 5006;
     private static final int DISCOVERY_UDP_PORT = 5007;
     private static final int POSITION_UDP_PORT = 5008;
+    private static final int FOV_UDP_PORT = 5009;
     private static final int DISCOVERY_TIMEOUT_MS = 1500;
     private static final int DISCOVERY_ATTEMPTS = 3;
     private static final int DISCOVERY_RETRY_DELAY_MS = 3000;
@@ -117,6 +123,15 @@ public class MainContent extends RelativeLayout {
     private static final String DISCOVERY_RESPONSE_PREFIX = "DJI_ROS2_BRIDGE|";
     private static final int VIDEO_QUEUE_CAPACITY = 120;
     private static final int VIDEO_CONNECT_TIMEOUT_MS = 3000;
+    private static final int VISUAL_CAMERA_INDEX = 0;
+    private static final int THERMAL_CAMERA_INDEX = 2;
+    // Mavic 2 Enterprise visual camera FoV at 1x / 24 mm equivalent.
+    private static final double BASE_VISUAL_FOV_DEG = 82.6;
+    // Thermal FoV depends on the installed thermal camera/lens; keep unset until that lens is known.
+    private static final double BASE_THERMAL_FOV_DEG = Double.NaN;
+    // DJI reports HYBRID_ZOOM_FOCAL_LENGTH as 24 mm equivalent * 10 at 1x, e.g. 240 = 24.0 mm.
+    private static final double BASE_VISUAL_FOCAL_LENGTH = 240.0;
+    private static final double BASE_THERMAL_FOCAL_LENGTH = Double.NaN;
 
     private final ScheduledExecutorService udpExecutor = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService bridgeExecutor = Executors.newSingleThreadExecutor();
@@ -124,12 +139,14 @@ public class MainContent extends RelativeLayout {
     private final BlockingQueue<byte[]> videoQueue = new ArrayBlockingQueue<>(VIDEO_QUEUE_CAPACITY);
     private volatile DatagramSocket gimbalSocket;
     private volatile DatagramSocket positionSocket;
+    private volatile DatagramSocket fovSocket;
     private volatile InetAddress rosPcAddress;
     private volatile String manualRosPcIp = "";
     private volatile boolean bridgeStartupRunning = false;
     private int bridgeStartGeneration = 0;
     private volatile boolean gimbalBridgeStarted = false;
     private volatile boolean positionBridgeStarted = false;
+    private volatile boolean fovBridgeStarted = false;
     private DJIKey gimbalAttitudeKey;
     private KeyListener gimbalAttitudeUpdater;
     private ScheduledFuture<?> gimbalSendTask;
@@ -156,6 +173,15 @@ public class MainContent extends RelativeLayout {
     private volatile Integer latestSatelliteCount;
     private volatile Object latestGpsSignalLevel;
     private volatile RTKState latestRtkState;
+    private ScheduledFuture<?> fovSendTask;
+    private final List<CameraZoomKeyCandidate> fovZoomKeyCandidates = new ArrayList<>();
+    private volatile int fovZoomRegisteredKeyCount = 0;
+    private volatile long fovZoomPushCount = 0;
+    private volatile CameraZoomSnapshot latestVisualZoomSnapshot =
+            CameraZoomSnapshot.empty(VISUAL_CAMERA_INDEX, "visual", BASE_VISUAL_FOV_DEG);
+    private volatile CameraZoomSnapshot latestThermalZoomSnapshot =
+            CameraZoomSnapshot.empty(THERMAL_CAMERA_INDEX, "thermal", BASE_THERMAL_FOV_DEG);
+    private volatile String latestFovStatus = "waiting_for_zoom";
     private VideoFeeder.VideoFeed primaryVideoFeed;
     private VideoFeeder.VideoFeed secondaryVideoFeed;
     private VideoFeeder.VideoFeed transcodedVideoFeed;
@@ -890,7 +916,11 @@ public class MainContent extends RelativeLayout {
     //endregion
 
     private synchronized void startDjiRosBridge() {
-        if (bridgeStartupRunning || gimbalBridgeStarted || positionBridgeStarted || videoBridgeStarted) {
+        if (bridgeStartupRunning
+                || gimbalBridgeStarted
+                || positionBridgeStarted
+                || fovBridgeStarted
+                || videoBridgeStarted) {
             return;
         }
 
@@ -930,6 +960,7 @@ public class MainContent extends RelativeLayout {
 
                         startGimbalUdpBridge();
                         startPositionUdpBridge();
+                        startFovUdpBridge();
                         startVideoTcpBridge();
 
                         synchronized (MainContent.this) {
@@ -948,6 +979,7 @@ public class MainContent extends RelativeLayout {
         bridgeStartupRunning = false;
         stopGimbalUdpBridge();
         stopPositionUdpBridge();
+        stopFovUdpBridge();
         stopVideoTcpBridge();
         rosPcAddress = null;
     }
@@ -1339,7 +1371,7 @@ public class MainContent extends RelativeLayout {
         try {
             keyManager.addListener(key, keyListener);
         } catch (Exception e) {
-            Log.d(TAG, "Position key listener add failed for " + name, e);
+            Log.d(TAG, "DJI key listener add failed for " + name, e);
         }
     }
 
@@ -1395,7 +1427,7 @@ public class MainContent extends RelativeLayout {
         try {
             keyManager.removeListener(keyListener);
         } catch (Exception e) {
-            Log.d(TAG, "Position key listener removal failed", e);
+            Log.d(TAG, "DJI key listener removal failed", e);
         }
     }
 
@@ -1422,7 +1454,7 @@ public class MainContent extends RelativeLayout {
         try {
             return keyManager.getValue(key);
         } catch (Exception e) {
-            Log.d(TAG, "Position key read failed", e);
+            Log.d(TAG, "DJI key read failed", e);
             return null;
         }
     }
@@ -1599,6 +1631,10 @@ public class MainContent extends RelativeLayout {
         builder.append(",\"").append(name).append("\":").append(value);
     }
 
+    private void appendJsonLong(StringBuilder builder, String name, long value) {
+        builder.append(",\"").append(name).append("\":").append(value);
+    }
+
     private void appendJsonFloat(StringBuilder builder, String name, Float value, int decimals) {
         builder.append(",\"").append(name).append("\":");
         if (value == null || !isFinite(value)) {
@@ -1611,6 +1647,15 @@ public class MainContent extends RelativeLayout {
     private void appendJsonDouble(StringBuilder builder, String name, double value, int decimals) {
         builder.append(",\"").append(name).append("\":");
         if (!isFinite(value)) {
+            builder.append("null");
+        } else {
+            builder.append(String.format(Locale.US, "%." + decimals + "f", value));
+        }
+    }
+
+    private void appendJsonDouble(StringBuilder builder, String name, Double value, int decimals) {
+        builder.append(",\"").append(name).append("\":");
+        if (value == null || !isFinite(value)) {
             builder.append("null");
         } else {
             builder.append(String.format(Locale.US, "%." + decimals + "f", value));
@@ -1656,6 +1701,641 @@ public class MainContent extends RelativeLayout {
                     data.length,
                     address,
                     POSITION_UDP_PORT
+            );
+            socket.send(packet);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static final class CameraZoomSnapshot {
+        final int cameraIndex;
+        final String cameraName;
+        final boolean zoomValid;
+        final boolean fovValid;
+        final String status;
+        final String zoomSource;
+        final Double zoomFactor;
+        final double baseFovDeg;
+        final Double adjustedFovDeg;
+        final String digitalZoomRaw;
+        final Double digitalZoomFactor;
+        final String thermalDigitalZoomRaw;
+        final Double thermalDigitalZoomFactor;
+        final Double opticalZoomScale;
+        final Integer opticalFocalLength;
+        final Integer hybridFocalLength;
+        final Double focalLengthZoomFactor;
+
+        static CameraZoomSnapshot empty(int cameraIndex, String cameraName, double baseFovDeg) {
+            return new CameraZoomSnapshot(
+                    cameraIndex,
+                    cameraName,
+                    false,
+                    false,
+                    "waiting_for_zoom",
+                    null,
+                    null,
+                    baseFovDeg,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null
+            );
+        }
+
+        CameraZoomSnapshot(
+                int cameraIndex,
+                String cameraName,
+                boolean zoomValid,
+                boolean fovValid,
+                String status,
+                String zoomSource,
+                Double zoomFactor,
+                double baseFovDeg,
+                Double adjustedFovDeg,
+                String digitalZoomRaw,
+                Double digitalZoomFactor,
+                String thermalDigitalZoomRaw,
+                Double thermalDigitalZoomFactor,
+                Double opticalZoomScale,
+                Integer opticalFocalLength,
+                Integer hybridFocalLength,
+                Double focalLengthZoomFactor
+        ) {
+            this.cameraIndex = cameraIndex;
+            this.cameraName = cameraName;
+            this.zoomValid = zoomValid;
+            this.fovValid = fovValid;
+            this.status = status;
+            this.zoomSource = zoomSource;
+            this.zoomFactor = zoomFactor;
+            this.baseFovDeg = baseFovDeg;
+            this.adjustedFovDeg = adjustedFovDeg;
+            this.digitalZoomRaw = digitalZoomRaw;
+            this.digitalZoomFactor = digitalZoomFactor;
+            this.thermalDigitalZoomRaw = thermalDigitalZoomRaw;
+            this.thermalDigitalZoomFactor = thermalDigitalZoomFactor;
+            this.opticalZoomScale = opticalZoomScale;
+            this.opticalFocalLength = opticalFocalLength;
+            this.hybridFocalLength = hybridFocalLength;
+            this.focalLengthZoomFactor = focalLengthZoomFactor;
+        }
+    }
+
+    private static final class CameraZoomKeyCandidate {
+        final int cameraIndex;
+        final String keyName;
+        final String label;
+        final DJIKey key;
+        KeyListener listener;
+        volatile Object latestValue;
+
+        CameraZoomKeyCandidate(int cameraIndex, String keyName, String label, DJIKey key) {
+            this.cameraIndex = cameraIndex;
+            this.keyName = keyName;
+            this.label = label;
+            this.key = key;
+        }
+    }
+
+    private synchronized void startFovUdpBridge() {
+        if (fovBridgeStarted) {
+            return;
+        }
+
+        BaseProduct product = DJISDKManager.getInstance().getProduct();
+        if (!(product instanceof Aircraft)) {
+            Toast.makeText(getContext(), "No aircraft connected yet", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        KeyManager keyManager = KeyManager.getInstance();
+        if (keyManager == null) {
+            Toast.makeText(getContext(), "KeyManager is null", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        InetAddress bridgeAddress = rosPcAddress;
+        if (bridgeAddress == null) {
+            Toast.makeText(getContext(), "DJI ROS bridge address is unknown", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        try {
+            fovSocket = new DatagramSocket();
+            registerFovZoomKeyCandidates(keyManager);
+
+            fovSendTask = udpExecutor.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    pollAndSendFovTelemetry();
+                }
+            }, 0, 1000, TimeUnit.MILLISECONDS);
+
+            fovBridgeStarted = true;
+        } catch (Exception e) {
+            Log.w(TAG, "FOV UDP bridge init failed", e);
+            stopFovUdpBridge();
+            Toast.makeText(getContext(), "FOV UDP init failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Toast.makeText(
+                getContext(),
+                "FOV UDP bridge started: " + bridgeAddress.getHostAddress(),
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    private synchronized void stopFovUdpBridge() {
+        if (fovSendTask != null) {
+            fovSendTask.cancel(true);
+            fovSendTask = null;
+        }
+
+        unregisterFovZoomKeyCandidates();
+        latestVisualZoomSnapshot = CameraZoomSnapshot.empty(VISUAL_CAMERA_INDEX, "visual", BASE_VISUAL_FOV_DEG);
+        latestThermalZoomSnapshot = CameraZoomSnapshot.empty(THERMAL_CAMERA_INDEX, "thermal", BASE_THERMAL_FOV_DEG);
+        latestFovStatus = "waiting_for_zoom";
+
+        if (fovSocket != null) {
+            fovSocket.close();
+            fovSocket = null;
+        }
+        fovBridgeStarted = false;
+    }
+
+    private void registerFovZoomKeyCandidates(KeyManager keyManager) {
+        unregisterFovZoomKeyCandidates();
+        if (keyManager == null) {
+            return;
+        }
+
+        Set<String> registeredKeyLabels = new HashSet<>();
+
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                VISUAL_CAMERA_INDEX,
+                CameraKey.DIGITAL_ZOOM_FACTOR,
+                "visual_index_0_DIGITAL_ZOOM_FACTOR",
+                createCameraKey(CameraKey.DIGITAL_ZOOM_FACTOR, VISUAL_CAMERA_INDEX)
+        );
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                VISUAL_CAMERA_INDEX,
+                CameraKey.DIGITAL_ZOOM_FACTOR,
+                "visual_default_DIGITAL_ZOOM_FACTOR",
+                createDefaultCameraKey(CameraKey.DIGITAL_ZOOM_FACTOR)
+        );
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                THERMAL_CAMERA_INDEX,
+                CameraKey.THERMAL_DIGITAL_ZOOM_FACTOR,
+                "thermal_index_2_THERMAL_DIGITAL_ZOOM_FACTOR",
+                createCameraKey(CameraKey.THERMAL_DIGITAL_ZOOM_FACTOR, THERMAL_CAMERA_INDEX)
+        );
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                VISUAL_CAMERA_INDEX,
+                CameraKey.OPTICAL_ZOOM_SCALE,
+                "visual_index_0_OPTICAL_ZOOM_SCALE",
+                createCameraKey(CameraKey.OPTICAL_ZOOM_SCALE, VISUAL_CAMERA_INDEX)
+        );
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                VISUAL_CAMERA_INDEX,
+                CameraKey.OPTICAL_ZOOM_FOCAL_LENGTH,
+                "visual_index_0_OPTICAL_ZOOM_FOCAL_LENGTH",
+                createCameraKey(CameraKey.OPTICAL_ZOOM_FOCAL_LENGTH, VISUAL_CAMERA_INDEX)
+        );
+        addFovZoomKeyCandidate(
+                keyManager,
+                registeredKeyLabels,
+                VISUAL_CAMERA_INDEX,
+                CameraKey.HYBRID_ZOOM_FOCAL_LENGTH,
+                "visual_index_0_HYBRID_ZOOM_FOCAL_LENGTH",
+                createCameraKey(CameraKey.HYBRID_ZOOM_FOCAL_LENGTH, VISUAL_CAMERA_INDEX)
+        );
+
+        int zoomLensIndex = getLensIndex(VISUAL_CAMERA_INDEX, SettingsDefinitions.LensType.ZOOM);
+        if (zoomLensIndex >= 0) {
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    VISUAL_CAMERA_INDEX,
+                    CameraKey.DIGITAL_ZOOM_FACTOR,
+                    "visual_lens_" + zoomLensIndex + "_DIGITAL_ZOOM_FACTOR",
+                    createLensCameraKey(CameraKey.DIGITAL_ZOOM_FACTOR, VISUAL_CAMERA_INDEX, zoomLensIndex)
+            );
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    VISUAL_CAMERA_INDEX,
+                    CameraKey.OPTICAL_ZOOM_SCALE,
+                    "visual_lens_" + zoomLensIndex + "_OPTICAL_ZOOM_SCALE",
+                    createLensCameraKey(CameraKey.OPTICAL_ZOOM_SCALE, VISUAL_CAMERA_INDEX, zoomLensIndex)
+            );
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    VISUAL_CAMERA_INDEX,
+                    CameraKey.OPTICAL_ZOOM_FOCAL_LENGTH,
+                    "visual_lens_" + zoomLensIndex + "_OPTICAL_ZOOM_FOCAL_LENGTH",
+                    createLensCameraKey(CameraKey.OPTICAL_ZOOM_FOCAL_LENGTH, VISUAL_CAMERA_INDEX, zoomLensIndex)
+            );
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    VISUAL_CAMERA_INDEX,
+                    CameraKey.HYBRID_ZOOM_FOCAL_LENGTH,
+                    "visual_lens_" + zoomLensIndex + "_HYBRID_ZOOM_FOCAL_LENGTH",
+                    createLensCameraKey(CameraKey.HYBRID_ZOOM_FOCAL_LENGTH, VISUAL_CAMERA_INDEX, zoomLensIndex)
+            );
+        }
+
+        int thermalLensIndex = getLensIndex(VISUAL_CAMERA_INDEX, SettingsDefinitions.LensType.INFRARED_THERMAL);
+        if (thermalLensIndex >= 0) {
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    THERMAL_CAMERA_INDEX,
+                    CameraKey.THERMAL_DIGITAL_ZOOM_FACTOR,
+                    "thermal_lens_" + thermalLensIndex + "_THERMAL_DIGITAL_ZOOM_FACTOR",
+                    createLensCameraKey(CameraKey.THERMAL_DIGITAL_ZOOM_FACTOR, VISUAL_CAMERA_INDEX, thermalLensIndex)
+            );
+            addFovZoomKeyCandidate(
+                    keyManager,
+                    registeredKeyLabels,
+                    THERMAL_CAMERA_INDEX,
+                    CameraKey.DIGITAL_ZOOM_FACTOR,
+                    "thermal_lens_" + thermalLensIndex + "_DIGITAL_ZOOM_FACTOR",
+                    createLensCameraKey(CameraKey.DIGITAL_ZOOM_FACTOR, VISUAL_CAMERA_INDEX, thermalLensIndex)
+            );
+        }
+
+        fovZoomRegisteredKeyCount = fovZoomKeyCandidates.size();
+        Log.i(TAG, "Registered FOV zoom key candidates: " + fovZoomRegisteredKeyCount);
+    }
+
+    private void addFovZoomKeyCandidate(
+            KeyManager keyManager,
+            Set<String> registeredKeyLabels,
+            int cameraIndex,
+            String keyName,
+            String label,
+            DJIKey key
+    ) {
+        if (keyManager == null || key == null || TextUtils.isEmpty(label) || registeredKeyLabels.contains(label)) {
+            return;
+        }
+        registeredKeyLabels.add(label);
+
+        final CameraZoomKeyCandidate candidate =
+                new CameraZoomKeyCandidate(cameraIndex, keyName, label, key);
+        candidate.latestValue = getKeyValue(keyManager, key);
+        candidate.listener = new KeyListener() {
+            @Override
+            public void onValueChange(Object oldValue, Object newValue) {
+                if (newValue != null) {
+                    candidate.latestValue = newValue;
+                    fovZoomPushCount++;
+                }
+            }
+        };
+
+        try {
+            keyManager.addListener(key, candidate.listener);
+            fovZoomKeyCandidates.add(candidate);
+        } catch (Exception e) {
+            Log.d(TAG, "FOV zoom key listener add failed for " + label, e);
+        }
+    }
+
+    private void unregisterFovZoomKeyCandidates() {
+        KeyManager keyManager = KeyManager.getInstance();
+        if (keyManager != null) {
+            for (CameraZoomKeyCandidate candidate : fovZoomKeyCandidates) {
+                if (candidate.listener != null) {
+                    try {
+                        keyManager.removeListener(candidate.listener);
+                    } catch (Exception e) {
+                        Log.d(TAG, "FOV zoom key listener removal failed for " + candidate.label, e);
+                    }
+                }
+            }
+        }
+        fovZoomKeyCandidates.clear();
+        fovZoomRegisteredKeyCount = 0;
+        fovZoomPushCount = 0;
+    }
+
+    private DJIKey createCameraKey(String keyName, int cameraIndex) {
+        try {
+            return CameraKey.create(keyName, cameraIndex);
+        } catch (Exception e) {
+            Log.d(TAG, "Camera key creation failed for " + keyName + " index=" + cameraIndex, e);
+            return null;
+        }
+    }
+
+    private DJIKey createDefaultCameraKey(String keyName) {
+        try {
+            return CameraKey.create(keyName);
+        } catch (Exception e) {
+            Log.d(TAG, "Default camera key creation failed for " + keyName, e);
+            return null;
+        }
+    }
+
+    private DJIKey createLensCameraKey(String keyName, int cameraIndex, int lensIndex) {
+        try {
+            return CameraKey.createLensKey(keyName, cameraIndex, lensIndex);
+        } catch (Exception e) {
+            Log.d(
+                    TAG,
+                    "Lens camera key creation failed for " + keyName
+                            + " camera=" + cameraIndex
+                            + " lens=" + lensIndex,
+                    e
+            );
+            return null;
+        }
+    }
+
+    private int getLensIndex(int cameraIndex, SettingsDefinitions.LensType lensType) {
+        try {
+            return CommonUtil.getLensIndex(cameraIndex, lensType);
+        } catch (Exception e) {
+            Log.d(TAG, "Lens index lookup failed for camera=" + cameraIndex + " lensType=" + lensType, e);
+            return -1;
+        }
+    }
+
+    private void pollAndSendFovTelemetry() {
+        KeyManager keyManager = KeyManager.getInstance();
+        if (keyManager == null) {
+            latestFovStatus = "keymanager_unavailable";
+            sendFovUdp(buildFovJson(System.currentTimeMillis(), latestVisualZoomSnapshot, latestThermalZoomSnapshot));
+            return;
+        }
+
+        CameraZoomSnapshot visual = readCameraZoomSnapshot(
+                keyManager,
+                VISUAL_CAMERA_INDEX,
+                "visual",
+                BASE_VISUAL_FOV_DEG,
+                BASE_VISUAL_FOCAL_LENGTH
+        );
+        CameraZoomSnapshot thermal = readCameraZoomSnapshot(
+                keyManager,
+                THERMAL_CAMERA_INDEX,
+                "thermal",
+                BASE_THERMAL_FOV_DEG,
+                BASE_THERMAL_FOCAL_LENGTH
+        );
+        latestVisualZoomSnapshot = visual;
+        latestThermalZoomSnapshot = thermal;
+        latestFovStatus = "visual:" + visual.status + ";thermal:" + thermal.status;
+        sendFovUdp(buildFovJson(System.currentTimeMillis(), visual, thermal));
+    }
+
+    private CameraZoomSnapshot readCameraZoomSnapshot(
+            KeyManager keyManager,
+            int cameraIndex,
+            String cameraName,
+            double baseFovDeg,
+            double baseFocalLength
+    ) {
+        Object digitalZoomValue = getCameraZoomKeyValue(keyManager, CameraKey.DIGITAL_ZOOM_FACTOR, cameraIndex);
+        Object thermalDigitalZoomValue =
+                getCameraZoomKeyValue(keyManager, CameraKey.THERMAL_DIGITAL_ZOOM_FACTOR, cameraIndex);
+        Object opticalZoomScaleValue = getCameraZoomKeyValue(keyManager, CameraKey.OPTICAL_ZOOM_SCALE, cameraIndex);
+        Object opticalFocalLengthValue =
+                getCameraZoomKeyValue(keyManager, CameraKey.OPTICAL_ZOOM_FOCAL_LENGTH, cameraIndex);
+        Object hybridFocalLengthValue =
+                getCameraZoomKeyValue(keyManager, CameraKey.HYBRID_ZOOM_FOCAL_LENGTH, cameraIndex);
+
+        Double digitalZoomFactor = parseZoomFactor(digitalZoomValue);
+        Double thermalDigitalZoomFactor = parseZoomFactor(thermalDigitalZoomValue);
+        Double opticalZoomScale = parseZoomFactor(opticalZoomScaleValue);
+        Integer opticalFocalLength = parseInteger(opticalFocalLengthValue);
+        Integer hybridFocalLength = parseInteger(hybridFocalLengthValue);
+
+        Double focalLengthZoomFactor = null;
+        String focalLengthSource = null;
+        if (isPositive(baseFocalLength)) {
+            if (isPositive(hybridFocalLength)) {
+                focalLengthZoomFactor = hybridFocalLength / baseFocalLength;
+                focalLengthSource = "HYBRID_ZOOM_FOCAL_LENGTH";
+            } else if (isPositive(opticalFocalLength)) {
+                focalLengthZoomFactor = opticalFocalLength / baseFocalLength;
+                focalLengthSource = "OPTICAL_ZOOM_FOCAL_LENGTH";
+            }
+        }
+
+        Double zoomFactor = null;
+        String zoomSource = null;
+        boolean focalLengthAlreadyHybrid = false;
+
+        if (focalLengthZoomFactor != null) {
+            zoomFactor = focalLengthZoomFactor;
+            zoomSource = focalLengthSource;
+            focalLengthAlreadyHybrid = "HYBRID_ZOOM_FOCAL_LENGTH".equals(focalLengthSource);
+        } else if (opticalZoomScale != null) {
+            zoomFactor = opticalZoomScale;
+            zoomSource = "OPTICAL_ZOOM_SCALE";
+        }
+
+        Double activeDigitalZoomFactor = thermalDigitalZoomFactor != null
+                ? thermalDigitalZoomFactor
+                : digitalZoomFactor;
+        String activeDigitalZoomSource = thermalDigitalZoomFactor != null
+                ? "THERMAL_DIGITAL_ZOOM_FACTOR"
+                : "DIGITAL_ZOOM_FACTOR";
+        if (!focalLengthAlreadyHybrid && activeDigitalZoomFactor != null) {
+            if (zoomFactor == null) {
+                zoomFactor = activeDigitalZoomFactor;
+                zoomSource = activeDigitalZoomSource;
+            } else {
+                zoomFactor *= activeDigitalZoomFactor;
+                zoomSource = appendStatus(zoomSource, activeDigitalZoomSource);
+            }
+        }
+
+        if (zoomFactor == null) {
+            zoomFactor = 1.0;
+            zoomSource = "DEFAULT_1X";
+        }
+
+        boolean zoomValid = isPositive(zoomFactor);
+        boolean baseFovValid = isPositive(baseFovDeg);
+        Double adjustedFovDeg = zoomValid && baseFovValid
+                ? computeAdjustedFovDeg(baseFovDeg, zoomFactor)
+                : null;
+        boolean fovValid = adjustedFovDeg != null;
+
+        String status;
+        if (zoomValid && fovValid && "DEFAULT_1X".equals(zoomSource)) {
+            status = "ok_default_zoom_1x";
+        } else if (zoomValid && fovValid) {
+            status = "ok";
+        } else if (zoomValid && "DEFAULT_1X".equals(zoomSource)) {
+            status = "default_zoom_1x;base_fov_not_configured";
+        } else if (zoomValid) {
+            status = "base_fov_not_configured";
+        } else if (baseFovValid) {
+            status = "zoom_key_unavailable";
+        } else {
+            status = "zoom_key_unavailable;base_fov_not_configured";
+        }
+
+        return new CameraZoomSnapshot(
+                cameraIndex,
+                cameraName,
+                zoomValid,
+                fovValid,
+                status,
+                zoomSource,
+                zoomFactor,
+                baseFovDeg,
+                adjustedFovDeg,
+                safeName(digitalZoomValue),
+                digitalZoomFactor,
+                safeName(thermalDigitalZoomValue),
+                thermalDigitalZoomFactor,
+                opticalZoomScale,
+                opticalFocalLength,
+                hybridFocalLength,
+                focalLengthZoomFactor
+        );
+    }
+
+    private String appendStatus(String previousStatus, String nextStatus) {
+        if (TextUtils.isEmpty(previousStatus)) {
+            return nextStatus;
+        }
+        return previousStatus + ";" + nextStatus;
+    }
+
+    private Object getCameraZoomKeyValue(KeyManager keyManager, String keyName, int cameraIndex) {
+        if (keyManager == null) {
+            return null;
+        }
+
+        Object cachedValue = null;
+        for (CameraZoomKeyCandidate candidate : fovZoomKeyCandidates) {
+            if (candidate.cameraIndex != cameraIndex || !keyName.equals(candidate.keyName)) {
+                continue;
+            }
+            Object currentValue = getKeyValue(keyManager, candidate.key);
+            if (currentValue != null) {
+                candidate.latestValue = currentValue;
+                return currentValue;
+            }
+            if (cachedValue == null && candidate.latestValue != null) {
+                cachedValue = candidate.latestValue;
+            }
+        }
+        if (cachedValue != null) {
+            return cachedValue;
+        }
+
+        return getKeyValue(keyManager, createCameraKey(keyName, cameraIndex));
+    }
+
+    private Double parseZoomFactor(Object value) {
+        if (value instanceof Number) {
+            double zoom = ((Number) value).doubleValue();
+            return isPositive(zoom) ? zoom : null;
+        }
+
+        String name = safeName(value);
+        if (TextUtils.isEmpty(name)) {
+            return null;
+        }
+        String normalized = name.toUpperCase(Locale.US)
+                .replace("FACTOR_", "")
+                .replace("ZOOM_", "")
+                .replace("X_", "")
+                .replace("X", "")
+                .replace("_DOT_", ".")
+                .replace("_", ".");
+        try {
+            double zoom = Double.parseDouble(normalized);
+            return isPositive(zoom) ? zoom : null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Integer parseInteger(Object value) {
+        if (value instanceof Integer) {
+            return (Integer) value;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        return null;
+    }
+
+    private boolean isPositive(Integer value) {
+        return value != null && value > 0;
+    }
+
+    private boolean isPositive(Double value) {
+        return value != null && isPositive(value.doubleValue());
+    }
+
+    private boolean isPositive(double value) {
+        return isFinite(value) && value > 0.0;
+    }
+
+    private Double computeAdjustedFovDeg(double baseFovDeg, double zoomFactor) {
+        if (!isPositive(baseFovDeg) || !isPositive(zoomFactor)) {
+            return null;
+        }
+        double baseFovRad = Math.toRadians(baseFovDeg);
+        return Math.toDegrees(2.0 * Math.atan(Math.tan(baseFovRad / 2.0) / zoomFactor));
+    }
+
+    private String buildFovJson(
+            long now,
+            CameraZoomSnapshot visualSnapshot,
+            CameraZoomSnapshot thermalSnapshot
+    ) {
+        StringBuilder builder = new StringBuilder(128);
+        builder.append("{\"t\":").append(now);
+        appendJsonString(builder, "source", "camera_zoom");
+        appendJsonDouble(builder, "zoom_factor", visualSnapshot.zoomFactor, 3);
+        appendJsonDouble(builder, "base_fov_deg", visualSnapshot.baseFovDeg, 3);
+        appendJsonDouble(builder, "adjusted_fov_deg", visualSnapshot.adjustedFovDeg, 3);
+        builder.append("}");
+        return builder.toString();
+    }
+
+    private void sendFovUdp(String message) {
+        try {
+            DatagramSocket socket = fovSocket;
+            InetAddress address = rosPcAddress;
+            if (socket == null || address == null || socket.isClosed()) {
+                return;
+            }
+            byte[] data = message.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket packet = new DatagramPacket(
+                    data,
+                    data.length,
+                    address,
+                    FOV_UDP_PORT
             );
             socket.send(packet);
         } catch (Exception ignored) {
