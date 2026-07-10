@@ -32,6 +32,7 @@ import com.dji.sdk.sample.internal.controller.MainActivity;
 import com.dji.sdk.sample.internal.model.ViewWrapper;
 import com.dji.sdk.sample.internal.utils.BridgeVideoPreviewView;
 import com.dji.sdk.sample.internal.utils.DialogUtils;
+import com.dji.sdk.sample.internal.utils.DjiMissionBridge;
 import com.dji.sdk.sample.internal.utils.GeneralUtils;
 import com.dji.sdk.sample.internal.utils.ToastUtils;
 import com.squareup.otto.Subscribe;
@@ -115,6 +116,7 @@ public class MainContent extends RelativeLayout {
     private static final int DISCOVERY_UDP_PORT = 5007;
     private static final int POSITION_UDP_PORT = 5008;
     private static final int FOV_UDP_PORT = 5009;
+    private static final int MISSION_TCP_PORT = 5010;
     private static final int DISCOVERY_TIMEOUT_MS = 1500;
     private static final int DISCOVERY_ATTEMPTS = 3;
     private static final int DISCOVERY_RETRY_DELAY_MS = 3000;
@@ -195,6 +197,8 @@ public class MainContent extends RelativeLayout {
     private volatile Socket videoSocket;
     private volatile boolean videoBridgeStarted = false;
     private volatile boolean videoBridgeRunning = false;
+    private volatile DjiMissionBridge missionBridge;
+    private volatile boolean missionBridgeStarted = false;
     private BaseComponent.ComponentListener mDJIComponentListener = new BaseComponent.ComponentListener() {
 
         @Override
@@ -920,7 +924,8 @@ public class MainContent extends RelativeLayout {
                 || gimbalBridgeStarted
                 || positionBridgeStarted
                 || fovBridgeStarted
-                || videoBridgeStarted) {
+                || videoBridgeStarted
+                || missionBridgeStarted) {
             return;
         }
 
@@ -962,6 +967,7 @@ public class MainContent extends RelativeLayout {
                         startPositionUdpBridge();
                         startFovUdpBridge();
                         startVideoTcpBridge();
+                        startMissionBridge();
 
                         synchronized (MainContent.this) {
                             if (startupGeneration == bridgeStartGeneration) {
@@ -981,6 +987,7 @@ public class MainContent extends RelativeLayout {
         stopPositionUdpBridge();
         stopFovUdpBridge();
         stopVideoTcpBridge();
+        stopMissionBridge();
         rosPcAddress = null;
     }
 
@@ -2462,6 +2469,36 @@ public class MainContent extends RelativeLayout {
         if (activeVideoBridge == this) {
             activeVideoBridge = null;
         }
+    }
+
+    private synchronized void startMissionBridge() {
+        if (missionBridgeStarted) {
+            return;
+        }
+
+        InetAddress bridgeAddress = rosPcAddress;
+        if (bridgeAddress == null) {
+            Toast.makeText(getContext(), "DJI ROS bridge address is unknown", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        missionBridge = new DjiMissionBridge(getContext(), bridgeAddress, MISSION_TCP_PORT);
+        missionBridge.start();
+        missionBridgeStarted = true;
+
+        Toast.makeText(
+                getContext(),
+                "Mission TCP bridge starting: " + bridgeAddress.getHostAddress(),
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    private synchronized void stopMissionBridge() {
+        if (missionBridge != null) {
+            missionBridge.stop();
+            missionBridge = null;
+        }
+        missionBridgeStarted = false;
     }
 
     private void scheduleBridgePreviewKeyFrameReset() {
