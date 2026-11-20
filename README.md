@@ -1,3 +1,17 @@
+# DJI Android app for the ROS 2 bridge
+
+This project adapts DJI's Mobile SDK 4.18 sample for the [DJI ROS 2 Bridge](https://github.com/Manouselis/dji_ros2_bridge). The app sends H.264 video and telemetry to a Linux PC on the same network. It also handles waypoint requests from the ROS 2 mission planner when mission mode is in use.
+
+## Build your APK
+
+1. Create an Android Mobile SDK app for package `com.dji.sdk.sample` in the [DJI Developer Center](https://developer.dji.com/user/apps/).
+2. Add `DJI_APP_KEY=your_key_here` to `~/.gradle/gradle.properties`. A local environment variable named `DJI_APP_KEY` also works when the Gradle property is absent. Keep the key outside the repository.
+3. With JDK 11 and Android SDK platform 33 installed, run `bash gradlew :app:assembleDebug` from `Sample Code`. Install your locally built `app/build/outputs/apk/debug/app-debug.apk`.
+
+Gradle inserts your key into the APK at build time. The app needs a valid key to register with DJI when first launched. Keep the locally built APK private unless you intend to distribute that key with the app. See the [ROS 2 bridge repository](https://github.com/Manouselis/dji_ros2_bridge) for the receiver setup.
+
+The original DJI sample documentation follows below. See [LICENSE.txt](LICENSE.txt) for the sample and SDK terms.
+
 # [MSDK V5 Released](https://github.com/dji-sdk/Mobile-SDK-Android-V5)
 
 MSDK V5 Supported Product:

@@ -3,6 +3,8 @@ apply plugin: 'kotlin-android'
 apply plugin: 'kotlin-android-extensions'
 apply plugin: 'kotlin-kapt'
 
+def djiAppKey = findProperty("DJI_APP_KEY") ?: System.getenv("DJI_APP_KEY") ?: ""
+
 repositories {
     mavenLocal()
 }
@@ -13,6 +15,7 @@ android {
 
     defaultConfig {
         applicationId "com.dji.sdk.sample"
+        resValue "string", "dji_bridge_app_key", djiAppKey
         minSdkVersion 23
         targetSdkVersion 34
         multiDexEnabled true
